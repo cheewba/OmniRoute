@@ -141,6 +141,7 @@ export async function registerNodejs(): Promise<void> {
         import("@/lib/providers/codexConnectionDefaults"),
         import("@/lib/modelAliasSeed"),
       ]);
+    const { isCloudSyncFeatureEnabled } = await import("@/lib/security/featureFlags");
     let settings = await getSettings();
     const passwordState = await ensurePersistentManagementPasswordHash({
       logger: console,
@@ -167,7 +168,7 @@ export async function registerNodejs(): Promise<void> {
       console.log(
         `[STARTUP] Migrated Codex connection defaults for ${migration.updatedConnectionIds.length} connection(s)`
       );
-      if (settings.cloudEnabled === true) {
+      if (settings.cloudEnabled === true && isCloudSyncFeatureEnabled()) {
         const [{ syncToCloud }, { getConsistentMachineId }] = await Promise.all([
           import("@/lib/cloudSync"),
           import("@/shared/utils/machineId"),

@@ -1,6 +1,7 @@
 import initializeCloudSync from "@/shared/services/initializeCloudSync";
 import { startBudgetResetJob } from "@/lib/jobs/budgetResetJob";
 import { startModelSyncScheduler } from "@/shared/services/modelSyncScheduler";
+import { isCloudSyncFeatureEnabled } from "@/lib/security/featureFlags";
 
 // Initialize runtime background sync services once per server process.
 let initialized = false;
@@ -18,6 +19,10 @@ export function shouldSkipCloudSyncInitialization(
   env: NodeJS.ProcessEnv = process.env,
   argv: string[] = process.argv
 ): boolean {
+  if (!isCloudSyncFeatureEnabled(env)) {
+    return true;
+  }
+
   if (env.NEXT_PHASE === "phase-production-build") {
     return true;
   }

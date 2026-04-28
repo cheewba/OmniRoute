@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { validateEncryptionConfig } from "@/lib/db/encryption";
+import { isStorageEncryptionRequired } from "@/lib/security/featureFlags";
 import { validateSecrets } from "@/shared/utils/secretsValidator";
 
 const NODE_ENV_VALUES = ["development", "production", "test"] as const;
@@ -63,6 +65,10 @@ export const webRuntimeEnvSchema = z.object({
   AUTH_COOKIE_SECURE: optionalBooleanEnv,
   PRICING_SYNC_ENABLED: optionalBooleanEnv,
   OMNIROUTE_DISABLE_BACKGROUND_SERVICES: optionalBooleanEnv,
+  OMNIROUTE_ENABLE_CLOUD_SYNC: optionalBooleanEnv,
+  OMNIROUTE_ENABLE_CLOUDFLARED: optionalBooleanEnv,
+  OMNIROUTE_REQUIRE_STORAGE_ENCRYPTION: optionalBooleanEnv,
+  STORAGE_ENCRYPTION_KEY: optionalTrimmedString,
   CLOUD_URL: optionalHttpUrl,
   NEXT_PUBLIC_CLOUD_URL: optionalHttpUrl,
   OMNIROUTE_PUBLIC_BASE_URL: optionalHttpUrl,
@@ -97,6 +103,26 @@ export function validateWebRuntimeEnv(
 
   if (!schemaValidation.success) {
     errors.push(...getSchemaIssues(schemaValidation.error));
+  }
+
+  if (isStorageEncryptionRequired(env)) {
+    const encryptionValidation = validateEncryptionConfig(env);
+    if (!env.STORAGE_ENCRYPTION_KEY) {
+      errors.push({
+        name: "STORAGE_ENCRYPTION_KEY",
+        issue:
+          'Invalid environment variable "STORAGE_ENCRYPTION_KEY": required when OMNIROUTE_REQUIRE_STORAGE_ENCRYPTION is enabled.',
+        hint: "Generate one with: openssl rand -base64 32",
+      });
+    } else if (!encryptionValidation.valid) {
+      errors.push({
+        name: "STORAGE_ENCRYPTION_KEY",
+        issue:
+          encryptionValidation.error ??
+          'Invalid environment variable "STORAGE_ENCRYPTION_KEY".',
+        hint: "Generate one with: openssl rand -base64 32",
+      });
+    }
   }
 
   return {

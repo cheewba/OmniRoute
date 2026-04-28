@@ -1,14 +1,25 @@
 import { getMachineId } from "@/shared/utils/machine";
+import { isCloudSyncFeatureEnabled } from "@/lib/security/featureFlags";
 
 // Function to get cloud URL with machine ID
 export function getCloudUrl(machineId) {
-  // Get from environment or default to localhost:8787
-  const cloudUrl = process.env.NEXT_PUBLIC_CLOUD_URL || "http://localhost:8787";
+  if (!isCloudSyncFeatureEnabled()) {
+    throw new Error("Cloud sync feature is disabled");
+  }
+
+  const cloudUrl = process.env.NEXT_PUBLIC_CLOUD_URL;
+  if (!cloudUrl) {
+    throw new Error("NEXT_PUBLIC_CLOUD_URL is not configured");
+  }
   return `${cloudUrl}/${machineId}/v1/chat/completions`;
 }
 
 // Function to call cloud with machine ID
 export async function callCloudWithMachineId(request) {
+  if (!isCloudSyncFeatureEnabled()) {
+    throw new Error("Cloud sync feature is disabled");
+  }
+
   const machineId = await getMachineId();
   if (!machineId) {
     throw new Error("Could not get machine ID");

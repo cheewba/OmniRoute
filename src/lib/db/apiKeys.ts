@@ -2,11 +2,13 @@
  * db/apiKeys.js — API key management.
  */
 
+import { createHmac } from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import { getDbInstance, rowToCamel } from "./core";
 import { backupDbFile } from "./backup";
 import { registerDbStateResetter } from "./stateReset";
 import { setNoLog } from "../compliance";
+import { decrypt, encrypt } from "./encryption";
 
 // ──────────────── Performance Optimizations ────────────────
 
@@ -124,6 +126,7 @@ const API_KEY_COLUMN_FALLBACKS = [
   { name: "expires_at", definition: "expires_at TEXT" },
   { name: "last_used_at", definition: "last_used_at TEXT" },
   { name: "key_prefix", definition: "key_prefix TEXT" },
+  { name: "key_hash", definition: "key_hash TEXT" },
   { name: "ip_allowlist", definition: "ip_allowlist TEXT" },
   { name: "scopes", definition: "scopes TEXT" },
 ] as const;
@@ -156,6 +159,50 @@ function toRecord(value: unknown): JsonRecord {
 function isConfiguredEnvApiKey(key: string): boolean {
   const envKey = process.env.OMNIROUTE_API_KEY || process.env.ROUTER_API_KEY;
   return Boolean(envKey && key === envKey);
+}
+
+function getApiKeyHashSecret(): string {
+  const secret = process.env.API_KEY_SECRET;
+  if (typeof secret === "string" && secret.trim().length > 0) {
+    return secret;
+  }
+  throw new Error("API_KEY_SECRET is required to hash stored API keys");
+}
+
+function computeApiKeyHash(key: string): string {
+  return createHmac("sha256", getApiKeyHashSecret()).update(key).digest("hex");
+}
+
+function decryptApiKeyValue(value: unknown): string | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const decrypted = decrypt(value);
+  return typeof decrypted === "string" ? decrypted : null;
+}
+
+function getStoredApiKeyHash(record: JsonRecord): string | null {
+  const value = record.key_hash ?? record.keyHash;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function backfillStoredApiKeyRecord(
+  db: ApiKeysDbLike,
+  row: JsonRecord | undefined,
+  rawKey: string
+): void {
+  if (!row || typeof row.id !== "string") return;
+
+  const currentStoredKey = typeof row.key === "string" ? row.key : rawKey;
+  const encryptedKey = encrypt(rawKey);
+  const keyHash = computeApiKeyHash(rawKey);
+  const currentHash = getStoredApiKeyHash(row);
+
+  if (currentStoredKey === encryptedKey && currentHash === keyHash) return;
+
+  db.prepare("UPDATE api_keys SET key = @key, key_hash = @keyHash WHERE id = @id").run({
+    id: row.id,
+    key: encryptedKey,
+    keyHash,
+  });
 }
 
 function markApiKeyUsed(db: ApiKeysDbLike, id: unknown, now: number): void {
@@ -248,13 +295,13 @@ function getPreparedStatements(db: ApiKeysDbLike): ApiKeysStatements {
     _stmtGetAllKeys = db.prepare<ApiKeyRow>("SELECT * FROM api_keys ORDER BY created_at");
     _stmtGetKeyById = db.prepare<ApiKeyRow>("SELECT * FROM api_keys WHERE id = ?");
     _stmtValidateKey = db.prepare<JsonRecord>(
-      "SELECT id, expires_at, revoked_at, is_active FROM api_keys WHERE key = ?"
+      "SELECT id, expires_at, revoked_at, is_active, key, key_hash FROM api_keys WHERE key_hash = ? OR key = ?"
     );
     _stmtGetKeyMetadata = db.prepare<ApiKeyRow>(
-      "SELECT id, name, machine_id, allowed_models, allowed_connections, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, max_sessions, revoked_at, expires_at, ip_allowlist, scopes FROM api_keys WHERE key = ?"
+      "SELECT id, name, machine_id, allowed_models, allowed_connections, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, max_sessions, revoked_at, expires_at, ip_allowlist, scopes, key, key_hash FROM api_keys WHERE key_hash = ? OR key = ?"
     );
     _stmtInsertKey = db.prepare(
-      "INSERT INTO api_keys (id, name, key, machine_id, allowed_models, no_log, created_at, key_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO api_keys (id, name, key, machine_id, allowed_models, no_log, created_at, key_prefix, key_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     _stmtDeleteKey = db.prepare("DELETE FROM api_keys WHERE id = ?");
   }
@@ -286,6 +333,10 @@ export async function getApiKeys() {
   const rows = stmt.getAllKeys.all();
   return rows.map((row) => {
     const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
+    const decryptedKey = decryptApiKeyValue(camelRow.key);
+    if (decryptedKey !== null) {
+      camelRow.key = decryptedKey;
+    }
     camelRow.allowedModels = parseAllowedModels(camelRow.allowedModels);
     camelRow.allowedConnections = parseAllowedConnections(camelRow.allowedConnections);
     camelRow.noLog = parseNoLog(camelRow.noLog);
@@ -305,6 +356,10 @@ export async function getApiKeyById(id: string) {
   const row = stmt.getKeyById.get(id);
   if (!row) return null;
   const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
+  const decryptedKey = decryptApiKeyValue(camelRow.key);
+  if (decryptedKey !== null) {
+    camelRow.key = decryptedKey;
+  }
   camelRow.allowedModels = parseAllowedModels(camelRow.allowedModels);
   camelRow.allowedConnections = parseAllowedConnections(camelRow.allowedConnections);
   camelRow.noLog = parseNoLog(camelRow.noLog);
@@ -439,12 +494,13 @@ export async function createApiKey(name: string, machineId: string) {
   stmt.insertKey.run(
     apiKey.id,
     apiKey.name,
-    apiKey.key,
+    encrypt(apiKey.key),
     apiKey.machineId,
     "[]",
     0,
     apiKey.createdAt,
-    apiKey.key.slice(0, 12)
+    apiKey.key.slice(0, 12),
+    computeApiKeyHash(apiKey.key)
   );
   setNoLog(apiKey.id, false);
 
@@ -674,9 +730,12 @@ export async function validateApiKey(key: string | null | undefined) {
 
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
-  const row = stmt.validateKey.get(key) as JsonRecord | undefined;
+  const keyHash = computeApiKeyHash(key);
+  const row = stmt.validateKey.get(keyHash, key) as JsonRecord | undefined;
 
   if (!row) return false;
+
+  backfillStoredApiKeyRecord(db, row, key);
 
   const isActive = parseIsActive(row.is_active ?? row.isActive);
   if (!isActive) return false;
@@ -737,11 +796,13 @@ export async function getApiKeyMetadata(
 
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
-  const row = stmt.getKeyMetadata.get(key);
+  const keyHash = computeApiKeyHash(key);
+  const row = stmt.getKeyMetadata.get(keyHash, key);
 
   if (!row) return null;
 
   const record = toRecord(row) as ApiKeyRow;
+  backfillStoredApiKeyRecord(db, record, key);
   const metadataId = typeof record.id === "string" ? record.id : "";
   const metadataName = typeof record.name === "string" ? record.name : "";
   const machineIdRaw = record.machine_id ?? record.machineId;

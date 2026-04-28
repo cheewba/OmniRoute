@@ -58,7 +58,7 @@ async function startServer() {
     startupLog.warn({ err }, "Log cleanup failed");
   }
 
-  startupLog.info("Starting server with cloud sync");
+  startupLog.info("Starting server runtime");
 
   try {
     let settings = await getSettings();
@@ -87,7 +87,7 @@ async function startServer() {
     startBudgetResetJob();
     startReasoningCacheCleanupJob();
     startRuntimeConfigHotReload();
-    startupLog.info("Server started with cloud sync initialized");
+    startupLog.info("Server runtime initialized");
 
     // Log server start event to audit log
     logAuditEvent({
@@ -99,7 +99,7 @@ async function startServer() {
       details: { timestamp: new Date().toISOString() },
     });
   } catch (error) {
-    startupLog.error({ err: error }, "Error initializing cloud sync");
+    startupLog.error({ err: error }, "Error initializing server runtime");
     process.exit(1);
   }
 

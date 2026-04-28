@@ -1,4 +1,5 @@
 import { getDbInstance } from "./core";
+import { decrypt, encrypt } from "./encryption";
 
 interface SecretRow {
   value?: string;
@@ -10,7 +11,11 @@ export function getPersistedSecret(key: string): string | null {
     const row = db
       .prepare("SELECT value FROM key_value WHERE namespace = 'secrets' AND key = ?")
       .get(key) as SecretRow | undefined;
-    return typeof row?.value === "string" ? JSON.parse(row.value) : null;
+    if (typeof row?.value !== "string") return null;
+    const parsed = JSON.parse(row.value);
+    if (typeof parsed !== "string") return null;
+    const decrypted = decrypt(parsed);
+    return typeof decrypted === "string" ? decrypted : null;
   } catch {
     return null;
   }
@@ -19,9 +24,10 @@ export function getPersistedSecret(key: string): string | null {
 export function persistSecret(key: string, value: string): void {
   try {
     const db = getDbInstance();
+    const storedValue = encrypt(value);
     db.prepare(
       "INSERT OR IGNORE INTO key_value (namespace, key, value) VALUES ('secrets', ?, ?)"
-    ).run(key, JSON.stringify(value));
+    ).run(key, JSON.stringify(storedValue));
   } catch {
     // Non-fatal: secrets still work for the current process if persistence fails.
   }

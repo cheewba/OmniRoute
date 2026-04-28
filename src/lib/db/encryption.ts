@@ -225,8 +225,10 @@ export function decryptConnectionFields<T extends ConnectionFields | null | unde
  * Validate encryption configuration at startup.
  * Returns { valid: true } or { valid: false, error: string } with actionable guidance.
  */
-export function validateEncryptionConfig(): { valid: boolean; error?: string } {
-  const secret = process.env.STORAGE_ENCRYPTION_KEY;
+export function validateEncryptionConfig(
+  env: NodeJS.ProcessEnv = process.env
+): { valid: boolean; error?: string } {
+  const secret = env.STORAGE_ENCRYPTION_KEY;
 
   // No key set — passthrough mode is fine
   if (!secret) return { valid: true };

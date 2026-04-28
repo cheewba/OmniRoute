@@ -1,5 +1,6 @@
 import { getProviderConnections, updateProviderConnection } from "@/lib/localDb";
 import { buildConfigSyncEnvelope, toLegacyCloudSyncPayload } from "@/lib/sync/bundle";
+import { isCloudSyncFeatureEnabled } from "@/lib/security/featureFlags";
 
 const CLOUD_URL = process.env.CLOUD_URL || process.env.NEXT_PUBLIC_CLOUD_URL;
 const CLOUD_SYNC_TIMEOUT_MS = Number(process.env.CLOUD_SYNC_TIMEOUT_MS || 12000);
@@ -38,6 +39,10 @@ export async function fetchWithTimeout(url, options = {}, timeoutMs = CLOUD_SYNC
  * @param {string|null} createdKey - Key created during enable
  */
 export async function syncToCloud(machineId, createdKey = null) {
+  if (!isCloudSyncFeatureEnabled()) {
+    return { error: "Cloud sync feature is disabled" };
+  }
+
   if (!CLOUD_URL) {
     return { error: "NEXT_PUBLIC_CLOUD_URL is not configured" };
   }

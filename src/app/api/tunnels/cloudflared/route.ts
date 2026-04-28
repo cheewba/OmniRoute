@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { isCloudflaredFeatureEnabled } from "@/lib/security/featureFlags";
 import {
   getCloudflaredTunnelStatus,
   startCloudflaredTunnel,
@@ -18,9 +19,19 @@ function unauthorized() {
   return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 }
 
+function featureDisabled() {
+  return NextResponse.json(
+    { error: "Cloudflared tunnel feature is disabled" },
+    { status: 403 }
+  );
+}
+
 export async function GET(request: NextRequest) {
   if (!(await isAuthenticated(request))) {
     return unauthorized();
+  }
+  if (!isCloudflaredFeatureEnabled()) {
+    return featureDisabled();
   }
 
   try {
@@ -39,6 +50,9 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   if (!(await isAuthenticated(request))) {
     return unauthorized();
+  }
+  if (!isCloudflaredFeatureEnabled()) {
+    return featureDisabled();
   }
 
   let rawBody: unknown;
