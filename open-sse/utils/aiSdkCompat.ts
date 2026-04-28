@@ -14,7 +14,8 @@ export function clientWantsJsonResponse(acceptHeader: unknown): boolean {
 /**
  * Resolves stream behavior from request body + Accept header.
  * Priority: explicit `stream: true/false` in body wins.
- * Accept header only acts as fallback when stream is not explicitly set.
+ * Without an explicit body flag, default to non-streaming for OpenAI compatibility.
+ * Only an explicit SSE Accept header should opt a request into streaming.
  * Fixes #656: clients sending both `stream: true` and `Accept: application/json`
  * should still get streaming responses — body intent takes precedence.
  */
@@ -22,8 +23,14 @@ export function resolveStreamFlag(bodyStream: unknown, acceptHeader: unknown): b
   // Explicit body value always wins
   if (bodyStream === true) return true;
   if (bodyStream === false) return false;
-  // No explicit stream param — fall back to Accept header heuristic
-  return !clientWantsJsonResponse(acceptHeader);
+
+  if (typeof acceptHeader === "string") {
+    const normalized = acceptHeader.toLowerCase();
+    if (normalized.includes("text/event-stream")) return true;
+  }
+
+  // No explicit stream param — preserve OpenAI-compatible default behavior.
+  return false;
 }
 
 /**
