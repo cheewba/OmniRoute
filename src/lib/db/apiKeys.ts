@@ -332,10 +332,12 @@ export async function getApiKeys() {
   const stmt = getPreparedStatements(db);
   const rows = stmt.getAllKeys.all();
   return rows.map((row) => {
+    const rawRow = toRecord(row);
     const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
     const decryptedKey = decryptApiKeyValue(camelRow.key);
     if (decryptedKey !== null) {
       camelRow.key = decryptedKey;
+      backfillStoredApiKeyRecord(db, rawRow, decryptedKey);
     }
     camelRow.allowedModels = parseAllowedModels(camelRow.allowedModels);
     camelRow.allowedConnections = parseAllowedConnections(camelRow.allowedConnections);
@@ -355,10 +357,12 @@ export async function getApiKeyById(id: string) {
   const stmt = getPreparedStatements(db);
   const row = stmt.getKeyById.get(id);
   if (!row) return null;
+  const rawRow = toRecord(row);
   const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
   const decryptedKey = decryptApiKeyValue(camelRow.key);
   if (decryptedKey !== null) {
     camelRow.key = decryptedKey;
+    backfillStoredApiKeyRecord(db, rawRow, decryptedKey);
   }
   camelRow.allowedModels = parseAllowedModels(camelRow.allowedModels);
   camelRow.allowedConnections = parseAllowedConnections(camelRow.allowedConnections);

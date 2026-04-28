@@ -15,6 +15,13 @@ export function getPersistedSecret(key: string): string | null {
     const parsed = JSON.parse(row.value);
     if (typeof parsed !== "string") return null;
     const decrypted = decrypt(parsed);
+    const reEncrypted = encrypt(decrypted ?? null);
+    if (typeof decrypted === "string" && typeof reEncrypted === "string" && reEncrypted !== parsed) {
+      db.prepare("UPDATE key_value SET value = ? WHERE namespace = 'secrets' AND key = ?").run(
+        JSON.stringify(reEncrypted),
+        key
+      );
+    }
     return typeof decrypted === "string" ? decrypted : null;
   } catch {
     return null;

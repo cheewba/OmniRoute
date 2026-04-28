@@ -53,6 +53,46 @@ function toNumberOrZero(value: unknown): number {
   return typeof value === "number" ? value : 0;
 }
 
+function backfillEncryptedConnectionFields(db: DbLike, row: JsonRecord): void {
+  if (typeof row.id !== "string") return;
+
+  const encryptedRow = encryptConnectionFields({
+    apiKey: typeof row.apiKey === "string" ? row.apiKey : null,
+    accessToken: typeof row.accessToken === "string" ? row.accessToken : null,
+    refreshToken: typeof row.refreshToken === "string" ? row.refreshToken : null,
+    idToken: typeof row.idToken === "string" ? row.idToken : null,
+  });
+
+  const nextApiKey = encryptedRow?.apiKey ?? null;
+  const nextAccessToken = encryptedRow?.accessToken ?? null;
+  const nextRefreshToken = encryptedRow?.refreshToken ?? null;
+  const nextIdToken = encryptedRow?.idToken ?? null;
+
+  if (
+    nextApiKey === (row.apiKey ?? null) &&
+    nextAccessToken === (row.accessToken ?? null) &&
+    nextRefreshToken === (row.refreshToken ?? null) &&
+    nextIdToken === (row.idToken ?? null)
+  ) {
+    return;
+  }
+
+  db.prepare(
+    `UPDATE provider_connections
+       SET api_key = @apiKey,
+           access_token = @accessToken,
+           refresh_token = @refreshToken,
+           id_token = @idToken
+     WHERE id = @id`
+  ).run({
+    id: row.id,
+    apiKey: nextApiKey,
+    accessToken: nextAccessToken,
+    refreshToken: nextRefreshToken,
+    idToken: nextIdToken,
+  });
+}
+
 // ──────────────── Provider Connections ────────────────
 
 export async function getProviderConnections(filter: JsonRecord = {}) {
@@ -78,6 +118,7 @@ export async function getProviderConnections(filter: JsonRecord = {}) {
   const rows = db.prepare(sql).all(params);
   return rows.map((r) => {
     const camelRow = rowToCamel(r);
+    backfillEncryptedConnectionFields(db, camelRow);
     return decryptConnectionFields(withNullableMaxConcurrent(cleanNulls(camelRow), camelRow));
   });
 }
@@ -88,6 +129,7 @@ export async function getProviderConnectionById(id: string) {
   if (!row) return null;
 
   const camelRow = rowToCamel(row);
+  backfillEncryptedConnectionFields(db, camelRow);
   return decryptConnectionFields(withNullableMaxConcurrent(cleanNulls(camelRow), camelRow));
 }
 
