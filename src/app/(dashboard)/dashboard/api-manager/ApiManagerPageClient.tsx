@@ -4,9 +4,20 @@ import { useState, useEffect, useMemo, useCallback, memo } from "react";
 import { Card, Button, Input, Modal, CardSkeleton } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useTranslations } from "next-intl";
+import { getProviderDisplayName } from "@/lib/display/names";
+import ApiKeyFilterBar from "./components/ApiKeyFilterBar";
+import {
+  isKeyActive,
+  isExpired,
+  isRestricted as isKeyRestricted,
+  classifyKeyStatus,
+  computeApiKeyCounts,
+} from "./apiManagerPageUtils";
+import type { KeyStatus, KeyType } from "./apiManagerPageUtils";
+import { readActiveOnlyPreference, writeActiveOnlyPreference } from "./apiManagerPageStorage";
 
 // Constants for validation
-const MAX_KEY_NAME_LENGTH = 100;
+const MAX_KEY_NAME_LENGTH = 200;
 const MAX_SELECTED_MODELS = 500;
 
 // Debounce hook for search optimization
@@ -42,8 +53,8 @@ function validateKeyName(
   if (name.length > MAX_KEY_NAME_LENGTH) {
     return { valid: false, error: t("keyNameTooLong", { max: MAX_KEY_NAME_LENGTH }) };
   }
-  // Only allow alphanumeric, spaces, hyphens, underscores
-  if (!/^[a-zA-Z0-9_\-\s]+$/.test(name)) {
+  // Allow Unicode letters (accented chars), numbers, spaces, hyphens, underscores
+  if (!/^[\p{L}\p{N}_\-\s]+$/u.test(name)) {
     return {
       valid: false,
       error: t("keyNameInvalid"),
@@ -69,8 +80,12 @@ interface ApiKey {
   noLog?: boolean;
   autoResolve?: boolean;
   isActive?: boolean;
+  isBanned?: boolean;
+  expiresAt?: string | null;
   maxSessions?: number;
   accessSchedule?: AccessSchedule | null;
+  rateLimits?: Array<{ limit: number; window: number }> | null;
+  scopes?: string[];
   createdAt: string;
 }
 
@@ -103,15 +118,23 @@ export default function ApiManagerPageClient() {
   const [loading, setLoading] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
+  const [newKeyManageEnabled, setNewKeyManageEnabled] = useState(false);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [editingKey, setEditingKey] = useState<ApiKey | null>(null);
   const [showPermissionsModal, setShowPermissionsModal] = useState(false);
   const [searchModel, setSearchModel] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [nameError, setNameError] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [usageStats, setUsageStats] = useState<Record<string, KeyUsageStats>>({});
   const [sessionCounts, setSessionCounts] = useState<Record<string, number>>({});
   const [allowKeyReveal, setAllowKeyReveal] = useState(false);
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeOnly, setActiveOnly] = useState(false);
+  const [statusFilter, setStatusFilter] = useState<KeyStatus | null>(null);
+  const [typeFilter, setTypeFilter] = useState<KeyType | null>(null);
 
   const { copied, copy } = useCopyToClipboard();
 
@@ -120,6 +143,14 @@ export default function ApiManagerPageClient() {
     fetchModels();
     fetchConnections();
   }, []);
+
+  useEffect(() => {
+    setActiveOnly(readActiveOnlyPreference());
+  }, []);
+
+  useEffect(() => {
+    writeActiveOnlyPreference(activeOnly);
+  }, [activeOnly]);
 
   const fetchModels = async () => {
     try {
@@ -174,27 +205,27 @@ export default function ApiManagerPageClient() {
         fetch("/api/usage/analytics?range=all"),
         fetch("/api/usage/call-logs?limit=1000"),
       ]);
-
       const analytics = analyticsRes.ok ? await analyticsRes.json() : null;
       const byApiKey: any[] = analytics?.byApiKey || [];
       const logs = logsRes.ok ? await logsRes.json() : [];
-
       const stats: Record<string, KeyUsageStats> = {};
-
       for (const key of apiKeys) {
-        // Match analytics entry by key name (reliable across both systems)
-        const analyticsMatch = byApiKey.find(
-          (entry: any) => entry.apiKeyName === key.name
+        // Match analytics entry by unique API Key ID (isolates usage to this specific key instance)
+        const matches = byApiKey.filter((entry: any) => entry.apiKeyId === key.id);
+        const totalRequests = matches.reduce(
+          (sum: number, entry: any) => sum + (Number(entry.requests) || 0),
+          0
         );
 
-        // The call-logs endpoint returns entries sorted by timestamp DESC,
-        // so the first match is the most recent one.
-        const lastUsed = (logs || []).find(
-          (log: any) => log.apiKeyName === key.name
+        // Match call logs by unique ID as well for the lastUsed timestamp
+        const lastUsed =
+          (logs || []).find((log: any) => log.apiKeyId === key.id)?.timestamp || null;
+        (logs || []).find(
+          (log: any) => log.apiKeyId === key.id || (!log.apiKeyId && log.apiKeyName === key.name)
         )?.timestamp || null;
 
         stats[key.id] = {
-          totalRequests: analyticsMatch?.requests ?? 0,
+          totalRequests,
           lastUsed,
         };
       }
@@ -229,26 +260,72 @@ export default function ApiManagerPageClient() {
     }
   };
 
-  const clearError = useCallback(() => setError(null), []);
+  const clearPageError = useCallback(() => setPageError(null), []);
 
-  const handleCreateKey = async () => {
-    // Validate and sanitize input
-    const sanitizedName = sanitizeInput(newKeyName);
-    const validation = validateKeyName(sanitizedName, t);
+  const keyCounts = useMemo(() => computeApiKeyCounts(keys), [keys]);
 
-    if (!validation.valid) {
-      setError(validation.error || t("invalidKeyName"));
-      return;
+  const filteredKeys = useMemo(() => {
+    let list = keys;
+
+    // 1. activeOnly toggle (shortcut for the most common case)
+    if (activeOnly) {
+      list = list.filter(isKeyActive);
     }
 
+    // 2. status chip filter
+    if (statusFilter === "active") list = list.filter(isKeyActive);
+    else if (statusFilter === "disabled") list = list.filter((k) => k.isActive === false);
+    else if (statusFilter === "banned") list = list.filter((k) => k.isBanned === true);
+    else if (statusFilter === "expired") list = list.filter(isExpired);
+
+    // 3. type chip filter
+    if (typeFilter === "manage") list = list.filter((k) => k.scopes?.includes("manage"));
+    else if (typeFilter === "restricted") list = list.filter(isKeyRestricted);
+    else if (typeFilter === "standard")
+      list = list.filter((k) => !k.scopes?.includes("manage") && !isKeyRestricted(k));
+
+    // 4. search query (case-insensitive substring on name and key)
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      list = list.filter(
+        (k) => k.name.toLowerCase().includes(q) || k.key.toLowerCase().includes(q)
+      );
+    }
+
+    return list;
+  }, [keys, activeOnly, statusFilter, typeFilter, searchQuery]);
+
+  const isFiltered =
+    activeOnly || statusFilter !== null || typeFilter !== null || searchQuery.trim() !== "";
+
+  const handleClearFilters = () => {
+    setSearchQuery("");
+    setActiveOnly(false);
+    setStatusFilter(null);
+    setTypeFilter(null);
+  };
+
+  const handleCreateKey = async () => {
+    // Validate raw input first, then sanitize
+    const validation = validateKeyName(newKeyName, t);
+    if (!validation.valid) {
+      setNameError(validation.error || t("invalidKeyName"));
+      return;
+    }
+    const sanitizedName = sanitizeInput(newKeyName);
+
     setIsSubmitting(true);
-    clearError();
+    setNameError(null);
+    setCreateError(null);
 
     try {
       const res = await fetch("/api/keys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: sanitizedName }),
+        body: JSON.stringify({
+          name: sanitizedName,
+          scopes: newKeyManageEnabled ? ["manage"] : [],
+        }),
       });
       const data = await res.json();
 
@@ -256,29 +333,29 @@ export default function ApiManagerPageClient() {
         setCreatedKey(data.key);
         await fetchData();
         setNewKeyName("");
+        setNewKeyManageEnabled(false);
         setShowAddModal(false);
       } else {
-        setError(data.error || t("failedCreateKey"));
+        setCreateError(data.error || t("failedCreateKey"));
       }
     } catch (error) {
       console.error("Error creating key:", error);
-      setError(t("failedCreateKeyRetry"));
+      setCreateError(t("failedCreateKeyRetry"));
     } finally {
       setIsSubmitting(false);
     }
   };
 
   const handleDeleteKey = async (id: string) => {
-    // Validate ID format to prevent injection
     if (!id || typeof id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(id)) {
-      setError(t("invalidKeyId"));
+      setPageError(t("invalidKeyId"));
       return;
     }
 
     if (!confirm(t("deleteConfirm"))) return;
 
     setIsSubmitting(true);
-    clearError();
+    clearPageError();
 
     try {
       const res = await fetch(`/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
@@ -286,11 +363,35 @@ export default function ApiManagerPageClient() {
         setKeys((prev) => prev.filter((k) => k.id !== id));
       } else {
         const data = await res.json();
-        setError(data.error || t("failedDeleteKey"));
+        setPageError(data.error || t("failedDeleteKey"));
       }
     } catch (error) {
       console.error("Error deleting key:", error);
-      setError(t("failedDeleteKeyRetry"));
+      setPageError(t("failedDeleteKeyRetry"));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleRegenerateKey = async (id: string) => {
+    if (!id) return;
+    if (!confirm(t("regenerateConfirm"))) return;
+
+    setIsSubmitting(true);
+    clearPageError();
+
+    try {
+      const res = await fetch(`/api/keys/${encodeURIComponent(id)}/regenerate`, { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setCreatedKey(data.key);
+        await fetchData();
+      } else {
+        setPageError(data.error || t("failedRegenerateKey"));
+      }
+    } catch (error) {
+      console.error("Error regenerating key:", error);
+      setPageError(t("failedRegenerateKeyRetry"));
     } finally {
       setIsSubmitting(false);
     }
@@ -322,25 +423,30 @@ export default function ApiManagerPageClient() {
   };
 
   const handleUpdatePermissions = async (
+    name: string,
     allowedModels: string[],
     noLog: boolean,
     allowedConnections: string[],
     autoResolve: boolean,
     isActive: boolean,
+    isBanned: boolean,
+    expiresAt: string | null,
     maxSessions: number,
-    accessSchedule: AccessSchedule | null
+    accessSchedule: AccessSchedule | null,
+    rateLimits: Array<{ limit: number; window: number }> | null,
+    scopes: string[]
   ) => {
     if (!editingKey || !editingKey.id) return;
 
+    const sanitizedName = sanitizeInput(name);
+
     // Validate models array
     if (!Array.isArray(allowedModels)) {
-      setError(t("invalidModelsSelection"));
       return;
     }
 
     // Limit number of selected models to prevent abuse
     if (allowedModels.length > MAX_SELECTED_MODELS) {
-      setError(t("cannotSelectMoreThanModels", { max: MAX_SELECTED_MODELS }));
       return;
     }
 
@@ -359,20 +465,25 @@ export default function ApiManagerPageClient() {
         : 0;
 
     setIsSubmitting(true);
-    clearError();
+    clearPageError();
 
     try {
       const res = await fetch(`/api/keys/${encodeURIComponent(editingKey.id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          name: sanitizedName,
           allowedModels: validModels,
           allowedConnections: validConnections,
           noLog,
           autoResolve,
           isActive,
+          isBanned,
+          expiresAt,
           maxSessions: normalizedMaxSessions,
           accessSchedule,
+          rateLimits,
+          scopes,
         }),
       });
 
@@ -382,11 +493,11 @@ export default function ApiManagerPageClient() {
         setEditingKey(null);
       } else {
         const data = await res.json();
-        setError(data.error || t("failedUpdatePermissions"));
+        setPageError(data.error || t("failedUpdatePermissions"));
       }
     } catch (error) {
       console.error("Error updating permissions:", error);
-      setError(t("failedUpdatePermissionsRetry"));
+      setPageError(t("failedUpdatePermissionsRetry"));
     } finally {
       setIsSubmitting(false);
     }
@@ -395,16 +506,19 @@ export default function ApiManagerPageClient() {
   // Debounced search for performance
   const debouncedSearchModel = useDebouncedValue(searchModel, 150);
 
-  // Group models by provider
+  // Group models by provider (issue #2021 — use centralized display helper so
+  // custom OpenAI-/Anthropic-compatible providers don't leak raw synthetic
+  // ids like "openai-compatible-chat-<uuid>" into the grouping label)
   const modelsByProvider = useMemo((): ProviderGroup[] => {
     const grouped: Record<string, Model[]> = {};
     for (const model of allModels) {
-      const provider = model.owned_by || t("unknownProvider");
+      const provider =
+        getProviderDisplayName(model.owned_by) || model.owned_by || t("unknownProvider");
       if (!grouped[provider]) grouped[provider] = [];
       grouped[provider].push(model);
     }
     return Object.entries(grouped).sort((a, b) => a[0].localeCompare(b[0]));
-  }, [allModels]);
+  }, [allModels, t]);
 
   // Filter models based on debounced search
   const filteredModelsByProvider = useMemo((): ProviderGroup[] => {
@@ -435,12 +549,12 @@ export default function ApiManagerPageClient() {
   return (
     <div className="flex flex-col gap-8">
       {/* Error Banner */}
-      {error && (
+      {pageError && (
         <div className="flex items-center gap-3 p-4 bg-red-500/10 border border-red-500/30 rounded-lg">
           <span className="material-symbols-outlined text-red-500">error</span>
-          <p className="text-sm text-red-700 dark:text-red-300 flex-1">{error}</p>
+          <p className="text-sm text-red-700 dark:text-red-300 flex-1">{pageError}</p>
           <button
-            onClick={clearError}
+            onClick={clearPageError}
             className="text-red-500 hover:text-red-700 transition-colors"
           >
             <span className="material-symbols-outlined">close</span>
@@ -507,18 +621,20 @@ export default function ApiManagerPageClient() {
         </div>
       )}
 
-      {/* Header Card */}
-      <Card>
-        <div className="flex items-center justify-between mb-4">
-          <div>
-            <h2 className="text-lg font-semibold">{t("keyManagement")}</h2>
-            <p className="text-sm text-text-muted">{t("keyManagementDesc")}</p>
-          </div>
-          <Button icon="add" onClick={() => setShowAddModal(true)}>
-            {t("createKey")}
-          </Button>
-        </div>
-      </Card>
+      {/* Filter Bar — shown when there are keys */}
+      {keys.length > 0 && (
+        <ApiKeyFilterBar
+          counts={keyCounts}
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+          activeOnly={activeOnly}
+          onActiveOnlyChange={setActiveOnly}
+          statusFilter={statusFilter}
+          onStatusChange={setStatusFilter}
+          typeFilter={typeFilter}
+          onTypeChange={setTypeFilter}
+        />
+      )}
 
       {/* Keys List Card */}
       <Card>
@@ -528,7 +644,19 @@ export default function ApiManagerPageClient() {
               <span className="material-symbols-outlined text-xl text-amber-500">vpn_key</span>
             </div>
             <div>
-              <h3 className="font-semibold">{t("registeredKeys")}</h3>
+              <h3 className="font-semibold">
+                {t("registeredKeys")}
+                {isFiltered && (
+                  <span className="ml-1.5 text-sm font-normal text-text-muted">
+                    ({t("shownOf", { shown: filteredKeys.length, total: keys.length })})
+                  </span>
+                )}
+                {!isFiltered && (
+                  <span className="ml-1.5 text-sm font-normal text-text-muted">
+                    ({keys.length})
+                  </span>
+                )}
+              </h3>
               <p className="text-xs text-text-muted">
                 {keys.length}{" "}
                 {keys.length === 1
@@ -537,6 +665,17 @@ export default function ApiManagerPageClient() {
               </p>
             </div>
           </div>
+          <Button
+            icon="add"
+            onClick={() => {
+              setNameError(null);
+              setCreateError(null);
+              clearPageError();
+              setShowAddModal(true);
+            }}
+          >
+            {t("createKey")}
+          </Button>
         </div>
 
         <p className="text-sm text-text-muted mb-4">{t("keysSecurityNote")}</p>
@@ -548,9 +687,24 @@ export default function ApiManagerPageClient() {
             </div>
             <p className="text-text-main font-medium mb-2">{t("noKeys")}</p>
             <p className="text-sm text-text-muted mb-4">{t("noKeysDesc")}</p>
-            <Button icon="add" onClick={() => setShowAddModal(true)}>
+            <Button
+              icon="add"
+              onClick={() => {
+                setNameError(null);
+                setCreateError(null);
+                setShowAddModal(true);
+              }}
+            >
               {t("createFirstKey")}
             </Button>
+          </div>
+        ) : filteredKeys.length === 0 ? (
+          <div className="text-center py-12 border border-dashed border-border rounded-lg">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-primary/10 text-primary mb-4">
+              <span className="material-symbols-outlined text-[32px]">search_off</span>
+            </div>
+            <p className="text-text-main font-medium mb-2">{t("emptyFilterTitle")}</p>
+            <Button onClick={handleClearFilters}>{t("emptyFilterClear")}</Button>
           </div>
         ) : (
           <div className="flex flex-col border border-border rounded-lg overflow-hidden">
@@ -565,13 +719,14 @@ export default function ApiManagerPageClient() {
             </div>
 
             {/* Table Rows */}
-            {keys.map((key) => {
+            {filteredKeys.map((key) => {
               const stats = usageStats[key.id];
               const isRestricted = Array.isArray(key.allowedModels) && key.allowedModels.length > 0;
               const hasConnectionRestrictions =
                 Array.isArray(key.allowedConnections) && key.allowedConnections.length > 0;
               const noLogEnabled = key.noLog === true;
               const keyIsActive = key.isActive !== false; // default true
+              const hasManageScope = Array.isArray(key.scopes) && key.scopes.includes("manage");
               const maxSessions = typeof key.maxSessions === "number" ? key.maxSessions : 0;
               const hasSessionLimit = maxSessions > 0;
               const activeSessions = sessionCounts[key.id] || 0;
@@ -663,6 +818,14 @@ export default function ApiManagerPageClient() {
                           Sessions: {activeSessions}/{maxSessions}
                         </span>
                       )}
+                      {hasManageScope && (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-500/10 text-rose-600 dark:text-rose-400 text-[11px] font-medium">
+                          <span className="material-symbols-outlined text-[12px]">
+                            admin_panel_settings
+                          </span>
+                          manage
+                        </span>
+                      )}
                       {!keyIsActive && (
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-red-500/10 text-red-600 dark:text-red-400 text-[11px] font-medium">
                           <span className="material-symbols-outlined text-[12px]">block</span>
@@ -673,6 +836,18 @@ export default function ApiManagerPageClient() {
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-orange-500/10 text-orange-600 dark:text-orange-400 text-[11px] font-medium">
                           <span className="material-symbols-outlined text-[12px]">schedule</span>
                           {t("scheduleActive")}
+                        </span>
+                      )}
+                      {key.isBanned && (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-red-600/10 text-red-700 dark:text-red-400 text-[11px] font-bold animate-pulse">
+                          <span className="material-symbols-outlined text-[12px]">gavel</span>
+                          BANNED
+                        </span>
+                      )}
+                      {key.expiresAt && new Date(key.expiresAt).getTime() < Date.now() && (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-gray-500/10 text-gray-600 dark:text-gray-400 text-[11px] font-medium">
+                          <span className="material-symbols-outlined text-[12px]">event_busy</span>
+                          EXPIRED
                         </span>
                       )}
                     </div>
@@ -694,6 +869,13 @@ export default function ApiManagerPageClient() {
                     {new Date(key.createdAt).toLocaleDateString()}
                   </div>
                   <div className="col-span-2 flex items-center justify-end gap-1">
+                    <button
+                      onClick={() => handleRegenerateKey(key.id)}
+                      className="p-2 hover:bg-amber-500/10 rounded text-text-muted hover:text-amber-500 opacity-0 group-hover:opacity-100 transition-all"
+                      title={t("regenerateKey")}
+                    >
+                      <span className="material-symbols-outlined text-[18px]">refresh</span>
+                    </button>
                     <button
                       onClick={() => handleOpenPermissions(key)}
                       className="p-2 hover:bg-primary/10 rounded text-text-muted hover:text-primary opacity-0 group-hover:opacity-100 transition-all"
@@ -753,6 +935,9 @@ export default function ApiManagerPageClient() {
         onClose={() => {
           setShowAddModal(false);
           setNewKeyName("");
+          setNewKeyManageEnabled(false);
+          setNameError(null);
+          setCreateError(null);
         }}
       >
         <div className="flex flex-col gap-4">
@@ -762,24 +947,63 @@ export default function ApiManagerPageClient() {
             </label>
             <Input
               value={newKeyName}
-              onChange={(e) => setNewKeyName(e.target.value)}
+              onChange={(e) => {
+                setNewKeyName(e.target.value);
+                setNameError(null);
+              }}
               placeholder={t("keyNamePlaceholder")}
+              maxLength={MAX_KEY_NAME_LENGTH}
+              error={nameError}
               autoFocus
             />
             <p className="text-xs text-text-muted mt-1.5">{t("keyNameDesc")}</p>
           </div>
+          <div className="flex items-start justify-between gap-3 p-3 rounded-lg border border-border bg-surface/40">
+            <div className="flex flex-col gap-1">
+              <p className="text-sm font-medium text-text-main">{t("managementAccess")}</p>
+              <p className="text-xs text-text-muted">{t("managementAccessDesc")}</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={newKeyManageEnabled}
+              onClick={() => setNewKeyManageEnabled((prev) => !prev)}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold transition-colors shrink-0 ${
+                newKeyManageEnabled
+                  ? "bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-rose-500/30"
+                  : "bg-black/5 dark:bg-white/5 text-text-muted border border-border"
+              }`}
+            >
+              <span className="material-symbols-outlined text-[14px]">admin_panel_settings</span>
+              {newKeyManageEnabled ? tc("enabled") : tc("disabled")}
+            </button>
+          </div>
+          {createError && (
+            <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30">
+              <span className="material-symbols-outlined text-red-500 text-sm">error</span>
+              <p className="text-sm text-red-700 dark:text-red-300 flex-1">{createError}</p>
+            </div>
+          )}
           <div className="flex gap-2">
             <Button
               onClick={() => {
                 setShowAddModal(false);
                 setNewKeyName("");
+                setNewKeyManageEnabled(false);
+                setNameError(null);
+                setCreateError(null);
               }}
               variant="ghost"
               fullWidth
             >
               {tc("cancel")}
             </Button>
-            <Button onClick={handleCreateKey} fullWidth disabled={!newKeyName.trim()}>
+            <Button
+              onClick={handleCreateKey}
+              fullWidth
+              disabled={!newKeyName.trim()}
+              loading={isSubmitting}
+            >
               {t("createKey")}
             </Button>
           </div>
@@ -862,13 +1086,18 @@ const PermissionsModal = memo(function PermissionsModal({
   searchModel: string;
   onSearchChange: (v: string) => void;
   onSave: (
+    name: string,
     models: string[],
     noLog: boolean,
     connections: string[],
     autoResolve: boolean,
     isActive: boolean,
+    isBanned: boolean,
+    expiresAt: string | null,
     maxSessions: number,
-    accessSchedule: AccessSchedule | null
+    accessSchedule: AccessSchedule | null,
+    rateLimits: Array<{ limit: number; window: number }> | null,
+    scopes: string[]
   ) => void;
 }) {
   const t = useTranslations("apiManager");
@@ -879,11 +1108,17 @@ const PermissionsModal = memo(function PermissionsModal({
   const initialConnections = Array.isArray(apiKey?.allowedConnections)
     ? apiKey.allowedConnections
     : [];
+  const [keyName, setKeyName] = useState(apiKey?.name ?? "");
   const [selectedModels, setSelectedModels] = useState<string[]>(initialModels);
   const [allowAll, setAllowAll] = useState(initialModels.length === 0);
   const [noLogEnabled, setNoLogEnabled] = useState(apiKey?.noLog === true);
   const [autoResolveEnabled, setAutoResolveEnabled] = useState(apiKey?.autoResolve === true);
   const [keyIsActive, setKeyIsActive] = useState(apiKey?.isActive !== false);
+  const [keyIsBanned, setKeyIsBanned] = useState(apiKey?.isBanned === true);
+  const [expiresAt, setExpiresAt] = useState(apiKey?.expiresAt ?? "");
+  const [manageEnabled, setManageEnabled] = useState(
+    Array.isArray(apiKey?.scopes) && apiKey.scopes.includes("manage")
+  );
   const [maxSessions, setMaxSessions] = useState(
     typeof apiKey?.maxSessions === "number" && apiKey.maxSessions > 0 ? apiKey.maxSessions : 0
   );
@@ -896,6 +1131,11 @@ const PermissionsModal = memo(function PermissionsModal({
   const [scheduleTz, setScheduleTz] = useState(
     apiKey?.accessSchedule?.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone
   );
+  const [rateLimits, setRateLimits] = useState<Array<{ limit: number; window: number }>>(
+    Array.isArray(apiKey?.rateLimits) ? apiKey.rateLimits : []
+  );
+  const [nameError, setNameError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [selectedConnections, setSelectedConnections] = useState<string[]>(initialConnections);
   const [allowAllConnections, setAllowAllConnections] = useState(initialConnections.length === 0);
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(() => {
@@ -983,6 +1223,29 @@ const PermissionsModal = memo(function PermissionsModal({
   );
 
   const handleSave = useCallback(() => {
+    // Clear previous inline errors
+    setNameError(null);
+    setSaveError(null);
+
+    // Validate name inline before calling onSave
+    const validation = validateKeyName(keyName, t);
+    if (!validation.valid) {
+      setNameError(validation.error || t("invalidKeyName"));
+      return;
+    }
+
+    // Validate models selection
+    if (!allowAll && !Array.isArray(selectedModels)) {
+      setSaveError(t("invalidModelsSelection"));
+      return;
+    }
+
+    // Limit number of selected models to prevent abuse
+    if (!allowAll && selectedModels.length > MAX_SELECTED_MODELS) {
+      setSaveError(t("cannotSelectMoreThanModels", { max: MAX_SELECTED_MODELS }));
+      return;
+    }
+
     const schedule: AccessSchedule | null = scheduleEnabled
       ? {
           enabled: true,
@@ -993,16 +1256,22 @@ const PermissionsModal = memo(function PermissionsModal({
         }
       : null;
     onSave(
+      keyName,
       allowAll ? [] : selectedModels,
       noLogEnabled,
       allowAllConnections ? [] : selectedConnections,
       autoResolveEnabled,
       keyIsActive,
+      keyIsBanned,
+      expiresAt || null,
       maxSessions,
-      schedule
+      schedule,
+      rateLimits.length > 0 ? rateLimits : null,
+      manageEnabled ? ["manage"] : []
     );
   }, [
     onSave,
+    keyName,
     allowAll,
     selectedModels,
     noLogEnabled,
@@ -1010,12 +1279,17 @@ const PermissionsModal = memo(function PermissionsModal({
     selectedConnections,
     autoResolveEnabled,
     keyIsActive,
+    keyIsBanned,
+    expiresAt,
     maxSessions,
+    manageEnabled,
     scheduleEnabled,
     scheduleFrom,
     scheduleUntil,
     scheduleDays,
     scheduleTz,
+    rateLimits,
+    t,
   ]);
 
   const selectedCount = selectedModels.length;
@@ -1028,6 +1302,34 @@ const PermissionsModal = memo(function PermissionsModal({
       onClose={onClose}
     >
       <div className="flex flex-col gap-4">
+        {/* Key Name */}
+        <div className="flex items-start justify-between gap-3 p-3 rounded-lg border border-border bg-surface/40">
+          <div className="flex flex-col gap-1">
+            <p className="text-sm font-medium text-text-main">{t("keyName")}</p>
+            <p className="text-xs text-text-muted">{t("keyNameDesc")}</p>
+          </div>
+          <div className="w-48 shrink-0">
+            <Input
+              value={keyName}
+              onChange={(e) => {
+                setKeyName(e.target.value);
+                setNameError(null);
+              }}
+              placeholder={t("keyNamePlaceholder")}
+              maxLength={MAX_KEY_NAME_LENGTH}
+              error={nameError}
+            />
+          </div>
+        </div>
+
+        {/* Inline save error */}
+        {saveError && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30">
+            <span className="material-symbols-outlined text-red-500 text-sm">error</span>
+            <p className="text-sm text-red-700 dark:text-red-300 flex-1">{saveError}</p>
+          </div>
+        )}
+
         {/* Access Mode Toggle */}
         <div className="flex gap-2 p-1 bg-surface rounded-lg">
           <button
@@ -1105,7 +1407,7 @@ const PermissionsModal = memo(function PermissionsModal({
         {/* Max Sessions Limit (T08) */}
         <div className="flex items-start justify-between gap-3 p-3 rounded-lg border border-border bg-surface/40">
           <div className="flex flex-col gap-1">
-            <p className="text-sm font-medium text-text-main">Max Active Sessions</p>
+            <p className="text-sm font-medium text-text-main">{t("maxActiveSessions")}</p>
             <p className="text-xs text-text-muted">
               0 = unlimited. Return 429 when this key exceeds concurrent sticky sessions.
             </p>
@@ -1122,6 +1424,74 @@ const PermissionsModal = memo(function PermissionsModal({
               }}
             />
           </div>
+        </div>
+
+        {/* Custom Rate Limits */}
+        <div className="flex flex-col gap-2 p-3 rounded-lg border border-border bg-surface/40">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex flex-col gap-1">
+              <p className="text-sm font-medium text-text-main">
+                {t("apiManagerCustomRateLimits")}
+              </p>
+              <p className="text-xs text-text-muted">{t("apiManagerCustomRateLimitsDesc")}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setRateLimits((prev) => [...prev, { limit: 100, window: 60 }])}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold bg-primary/10 text-primary hover:bg-primary/20 transition-colors shrink-0"
+            >
+              <span className="material-symbols-outlined text-[14px]">add</span>
+              Add Limit
+            </button>
+          </div>
+          {rateLimits.length > 0 && (
+            <div className="flex flex-col gap-2 pt-2">
+              {rateLimits.map((rl, index) => (
+                <div key={index} className="flex gap-2 items-center">
+                  <Input
+                    type="number"
+                    min={1}
+                    value={String(rl.limit)}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value) || 0;
+                      setRateLimits((prev) => {
+                        const next = [...prev];
+                        next[index].limit = val;
+                        return next;
+                      });
+                    }}
+                    placeholder={t("apiManagerRateLimitRequestsPlaceholder")}
+                  />
+                  <span className="text-sm text-text-muted shrink-0">
+                    {t("apiManagerRateLimitReqPer")}
+                  </span>
+                  <Input
+                    type="number"
+                    min={1}
+                    value={String(rl.window)}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value) || 0;
+                      setRateLimits((prev) => {
+                        const next = [...prev];
+                        next[index].window = val;
+                        return next;
+                      });
+                    }}
+                    placeholder={t("apiManagerRateLimitSecondsPlaceholder")}
+                  />
+                  <span className="text-sm text-text-muted shrink-0">sec</span>
+                  <button
+                    type="button"
+                    onClick={() => setRateLimits((prev) => prev.filter((_, i) => i !== index))}
+                    className="p-2 text-red-500 hover:bg-red-500/10 rounded transition-colors shrink-0"
+                    title={t("apiManagerRemoveLimitTitle")}
+                  >
+                    <span className="material-symbols-outlined text-[18px]">delete</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Access Schedule */}
@@ -1214,7 +1584,7 @@ const PermissionsModal = memo(function PermissionsModal({
                   type="text"
                   value={scheduleTz}
                   onChange={(e) => setScheduleTz(e.target.value)}
-                  placeholder="America/Sao_Paulo"
+                  placeholder={t("apiManagerTimezonePlaceholder")}
                   className="w-full px-2 py-1.5 text-sm border border-border rounded-md bg-background text-text-main font-mono"
                 />
                 <p className="text-[10px] text-text-muted mt-1">{t("scheduleTimezoneHint")}</p>
@@ -1226,7 +1596,7 @@ const PermissionsModal = memo(function PermissionsModal({
         {/* Privacy Toggle */}
         <div className="flex items-start justify-between gap-3 p-3 rounded-lg border border-border bg-surface/40">
           <div className="flex flex-col gap-1">
-            <p className="text-sm font-medium text-text-main">No-Log Payload Privacy</p>
+            <p className="text-sm font-medium text-text-main">{t("noLogPayloadPrivacy")}</p>
             <p className="text-xs text-text-muted">
               Disable request/response payload persistence for this API key.
             </p>
@@ -1270,6 +1640,71 @@ const PermissionsModal = memo(function PermissionsModal({
               {autoResolveEnabled ? "auto_fix_high" : "auto_fix_normal"}
             </span>
             {autoResolveEnabled ? tc("enabled") : tc("disabled")}
+          </button>
+        </div>
+
+        {/* Ban Toggle (SECURITY) */}
+        <div className="flex items-start justify-between gap-3 p-3 rounded-lg border border-red-500/20 bg-red-500/5">
+          <div className="flex flex-col gap-1">
+            <p className="text-sm font-bold text-red-700 dark:text-red-400">{t("bannedStatus")}</p>
+            <p className="text-xs text-red-600 dark:text-red-300">
+              Immediately revoke all access. Used for suspected abuse or compromised keys.
+            </p>
+          </div>
+          <button
+            role="switch"
+            aria-checked={keyIsBanned}
+            onClick={() => setKeyIsBanned((prev) => !prev)}
+            className={`inline-flex shrink-0 items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-bold transition-colors ${
+              keyIsBanned
+                ? "bg-red-500 text-white shadow-sm"
+                : "bg-black/5 dark:bg-white/5 text-text-muted hover:bg-black/10 dark:hover:bg-white/10"
+            }`}
+          >
+            <span className="material-symbols-outlined text-[14px]">
+              {keyIsBanned ? "block" : "check_circle"}
+            </span>
+            {keyIsBanned ? "Banned" : "Active"}
+          </button>
+        </div>
+        {/* Expiration Date */}
+        <div className="flex flex-col gap-2 p-3 rounded-lg border border-border bg-surface/40">
+          <div className="flex flex-col gap-1">
+            <p className="text-sm font-medium text-text-main">{t("expirationDate")}</p>
+            <p className="text-xs text-text-muted">
+              Key will automatically stop working after this date.
+            </p>
+          </div>
+          <input
+            type="datetime-local"
+            value={expiresAt ? expiresAt.slice(0, 16) : ""}
+            onChange={(e) => {
+              const val = e.target.value;
+              setExpiresAt(val ? new Date(val).toISOString() : "");
+            }}
+            className="w-full px-2 py-1.5 text-sm border border-border rounded-md bg-background text-text-main"
+          />
+        </div>
+        {/* Management Access */}
+        <div className="flex flex-col gap-2 p-3 rounded-lg border border-border bg-surface/40">
+          <div className="flex flex-col gap-1">
+            <p className="text-sm font-medium text-text-main">{t("managementAccess")}</p>
+            <p className="text-xs text-text-muted">
+              Allow this API key to manage OmniRoute configuration.
+            </p>
+          </div>
+          <button
+            role="switch"
+            aria-checked={manageEnabled}
+            onClick={() => setManageEnabled((prev) => !prev)}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold transition-colors ${
+              manageEnabled
+                ? "bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-rose-500/30"
+                : "bg-black/5 dark:bg-white/5 text-text-muted border border-border"
+            }`}
+          >
+            <span className="material-symbols-outlined text-[14px]">admin_panel_settings</span>
+            {manageEnabled ? tc("enabled") : tc("disabled")}
           </button>
         </div>
 
@@ -1442,7 +1877,7 @@ const PermissionsModal = memo(function PermissionsModal({
         {allConnections.length > 0 && (
           <div className="flex flex-col gap-2 p-3 rounded-lg border border-border bg-surface/40">
             <div className="flex items-center justify-between">
-              <p className="text-sm font-medium text-text-main">Allowed Connections</p>
+              <p className="text-sm font-medium text-text-main">{t("allowedConnections")}</p>
               <div className="flex gap-1 p-0.5 bg-surface rounded-md">
                 <button
                   onClick={() => {

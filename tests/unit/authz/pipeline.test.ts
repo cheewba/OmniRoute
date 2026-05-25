@@ -84,6 +84,40 @@ test("runAuthzPipeline redirects unauthenticated dashboard pages to login", asyn
   assert.ok(response.headers.get("x-request-id"));
 });
 
+test("runAuthzPipeline allows onboarding when login is required but no password exists", async () => {
+  delete process.env.INITIAL_PASSWORD;
+  await settingsDb.updateSettings({
+    requireLogin: true,
+    setupComplete: true,
+    password: "",
+  });
+
+  const response = await pipeline.runAuthzPipeline(
+    request("https://example.com/dashboard/onboarding"),
+    { enforce: true }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-omniroute-route-class"), "PUBLIC");
+});
+
+test("runAuthzPipeline allows first password writes when login is required but no password exists", async () => {
+  delete process.env.INITIAL_PASSWORD;
+  await settingsDb.updateSettings({
+    requireLogin: true,
+    setupComplete: true,
+    password: "",
+  });
+
+  const response = await pipeline.runAuthzPipeline(
+    request("https://example.com/api/settings/require-login", { method: "POST" }),
+    { enforce: true }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-omniroute-route-class"), "MANAGEMENT");
+});
+
 test("runAuthzPipeline keeps management API rejections as JSON", async () => {
   await forceAuthRequired();
 
@@ -172,6 +206,20 @@ test("runAuthzPipeline allows dashboard sessions to read model catalog aliases",
 
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("x-omniroute-route-class"), "CLIENT_API");
+});
+
+test("runAuthzPipeline allows dashboard sessions to reach DB health management API", async () => {
+  await forceAuthRequired();
+
+  const response = await pipeline.runAuthzPipeline(
+    request("http://localhost/api/db/health", {
+      headers: { cookie: await dashboardCookie() },
+    }),
+    { enforce: true }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-omniroute-route-class"), "MANAGEMENT");
 });
 
 test("runAuthzPipeline refreshes dashboard JWTs near expiry", async () => {

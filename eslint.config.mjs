@@ -10,6 +10,17 @@ const eslintConfig = [
       "no-eval": "error",
       "no-implied-eval": "error",
       "no-new-func": "error",
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "prop-types",
+              message: "PropTypes are deprecated. Use TypeScript types/interfaces instead.",
+            },
+          ],
+        },
+      ],
     },
   },
   // Relaxed rules for open-sse and tests (incremental adoption)
@@ -39,6 +50,8 @@ const eslintConfig = [
       "bin/**",
       // Dependencies
       "node_modules/**",
+      ".worktrees/**",
+      ".omnivscodeagent/**",
       // VS Code extension and its large test fixtures
       "vscode-extension/**",
       "_references/**",

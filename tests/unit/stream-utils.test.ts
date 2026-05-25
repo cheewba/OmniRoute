@@ -561,6 +561,62 @@ test("createSSEStream passthrough injects a synthetic Claude text block for empt
   );
 });
 
+test("createSSEStream passthrough does not emit [DONE] for Claude SSE clients", async () => {
+  const text = await readTransformed(
+    [
+      `event: message_start\ndata: ${JSON.stringify({
+        type: "message_start",
+        message: {
+          id: "msg_claude_done_gate",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4",
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 3, output_tokens: 0 },
+        },
+      })}\n\n`,
+      `event: content_block_start\ndata: ${JSON.stringify({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      })}\n\n`,
+      `event: content_block_delta\ndata: ${JSON.stringify({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Claude client stream" },
+      })}\n\n`,
+      `event: content_block_stop\ndata: ${JSON.stringify({
+        type: "content_block_stop",
+        index: 0,
+      })}\n\n`,
+      `event: message_delta\ndata: ${JSON.stringify({
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: 3 },
+      })}\n\n`,
+      `event: message_stop\ndata: ${JSON.stringify({
+        type: "message_stop",
+      })}\n\n`,
+    ],
+    {
+      mode: "passthrough",
+      sourceFormat: FORMATS.CLAUDE,
+      clientResponseFormat: FORMATS.CLAUDE,
+      provider: "claude",
+      model: "claude-sonnet-4",
+      body: {
+        messages: [{ role: "user", content: "hello" }],
+      },
+    }
+  );
+
+  assert.match(text, /event: message_stop/);
+  assert.match(text, /Claude client stream/);
+  assert.doesNotMatch(text, /\[DONE\]/);
+});
+
 test("createSSEStream translate mode injects a synthetic Claude text block when OpenAI finishes empty", async () => {
   let onCompletePayload = null;
   const text = await readTransformed(
@@ -797,7 +853,7 @@ test("createSSETransformStreamWithLogger flushes Responses API terminal events o
 
   assert.match(text, /response\.created/);
   assert.match(text, /response\.completed/);
-  assert.match(text, /\[DONE\]/);
+  assert.doesNotMatch(text, /\[DONE\]/);
 });
 
 test("createPassthroughStreamWithLogger reuses passthrough mode helpers", async () => {
@@ -971,4 +1027,64 @@ test("createRequestLogger caps retained stream chunk item count", async () => {
     "one",
     "[stream chunk log truncated after 2 chunks]",
   ]);
+});
+
+// T-VERIFY: passthrough mode failure decrements pending requests
+// Regression test for missing trackPendingRequest(false) on passthrough failure
+import { getPendingRequests, clearPendingRequests } from "../../src/lib/usage/usageHistory.ts";
+
+test("createSSEStream passthrough mode decrements pending requests on failure", async () => {
+  // Clear any existing pending requests first
+  clearPendingRequests();
+  const initial = getPendingRequests();
+  assert.equal(Object.keys(initial.byModel).length, 0, "should start with no pending requests");
+
+  let failurePayload = null;
+  const testProvider = "openai-compatible-test-failure";
+  const testModel = "gpt-test";
+  const testConnectionId = "test-conn-123";
+
+  await assert.rejects(
+    readTransformed(
+      [
+        `data: ${JSON.stringify({
+          type: "response.failed",
+          response: {
+            id: "resp_failed_test",
+            object: "response",
+            model: testModel,
+            status: "failed",
+            error: {
+              code: "test_failure",
+              message: "Test failure for pending request tracking",
+            },
+          },
+        })}\n\n`,
+      ],
+      {
+        mode: "passthrough",
+        sourceFormat: FORMATS.OPENAI_RESPONSES,
+        provider: testProvider,
+        model: testModel,
+        connectionId: testConnectionId,
+        body: { input: "hello" },
+        onFailure(payload) {
+          failurePayload = payload;
+        },
+      }
+    ),
+    /Test failure|Upstream failure/
+  );
+
+  assert.ok(failurePayload, "should report the stream failure");
+
+  // Verify pending requests are properly decremented after failure
+  const pending = getPendingRequests();
+  const modelKey = `${testModel} (${testProvider})`;
+  const count = pending.byModel[modelKey] || 0;
+  assert.equal(
+    count,
+    0,
+    `pending request count for ${modelKey} should be 0 after failure, got ${count}`
+  );
 });

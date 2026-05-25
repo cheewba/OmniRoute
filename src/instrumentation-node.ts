@@ -136,12 +136,17 @@ export async function registerNodejs(): Promise<void> {
   }
 
   try {
-    const [{ migrateCodexConnectionDefaultsFromLegacySettings }, { seedDefaultModelAliases }] =
-      await Promise.all([
-        import("@/lib/providers/codexConnectionDefaults"),
-        import("@/lib/modelAliasSeed"),
-      ]);
-    const { isCloudSyncFeatureEnabled } = await import("@/lib/security/featureFlags");
+    const [
+      { migrateCodexConnectionDefaultsFromLegacySettings },
+      { startSessionAccountAffinityCleanup },
+      { seedDefaultModelAliases },
+      { isCloudSyncFeatureEnabled },
+    ] = await Promise.all([
+      import("@/lib/providers/codexConnectionDefaults"),
+      import("@/lib/db/sessionAccountAffinity"),
+      import("@/lib/modelAliasSeed"),
+      import("@/lib/security/featureFlags"),
+    ]);
     let settings = await getSettings();
     const passwordState = await ensurePersistentManagementPasswordHash({
       logger: console,
@@ -162,6 +167,7 @@ export async function registerNodejs(): Promise<void> {
     console.log(
       `[STARTUP] Model alias seed: applied=${seededModelAliases.applied.length}, skipped=${seededModelAliases.skipped.length}, failed=${seededModelAliases.failed.length}`
     );
+    startSessionAccountAffinityCleanup();
 
     const migration = await migrateCodexConnectionDefaultsFromLegacySettings();
     if (migration.migrated) {
@@ -205,4 +211,6 @@ export async function registerNodejs(): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn("[COMPLIANCE] Could not initialize audit log:", msg);
   }
+
+  await import("@/lib/db/core").then(({ ensureDbInitialized }) => ensureDbInitialized());
 }

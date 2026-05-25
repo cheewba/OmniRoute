@@ -1,14 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { validateProviderApiKey, validateClaudeCodeCompatibleProvider } =
-  await import("../../src/lib/providers/validation.ts");
+const {
+  validateProviderApiKey,
+  validateClaudeCodeCompatibleProvider,
+  validateCommandCodeProvider,
+} = await import("../../src/lib/providers/validation.ts");
+
+const { __setTlsFetchOverrideForTesting: __setPplxTlsFetchOverride } =
+  await import("../../open-sse/services/perplexityTlsClient.ts");
 
 const originalFetch = globalThis.fetch;
 
 test.afterEach(() => {
   globalThis.fetch = originalFetch;
+  __setPplxTlsFetchOverride(null);
 });
+
+function toPlainHeaders(headers: any) {
+  if (headers instanceof Headers) return Object.fromEntries(headers.entries());
+  return Object.fromEntries(
+    Object.entries(headers || {}).map(([key, value]) => [key, String(value)])
+  );
+}
 
 function metaAiSseText(content: string, streamingState = "DONE") {
   return `event: next
@@ -71,6 +85,40 @@ test("specialty provider validators cover Deepgram, AssemblyAI, NanoBanana, Elev
   assert.equal(banana.error, "Invalid API key");
   assert.equal(eleven.valid, true);
   assert.equal(inworld.valid, true);
+});
+
+test("validateCommandCodeProvider ignores caller baseUrl and chatPath overrides", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    assert.equal(String(url), "https://api.commandcode.ai/alpha/generate");
+    const headers = init.headers as Record<string, string>;
+    assert.equal(headers.Authorization, "Bearer cc-key");
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.params.model, "command-code-validation-model");
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const result = await validateCommandCodeProvider({
+    apiKey: "cc-key",
+    providerSpecificData: {
+      baseUrl: "https://evil.example/api",
+      chatPath: "/v1/chat/completions",
+      validationModelId: "command-code-validation-model",
+    },
+  });
+
+  assert.equal(result.valid, true);
+});
+
+test("validateCommandCodeProvider defaults probe model to DeepSeek flash", async () => {
+  globalThis.fetch = async (_url, init = {}) => {
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.params.model, "deepseek/deepseek-v4-flash");
+    return new Response("", { status: 400 });
+  };
+
+  const result = await validateCommandCodeProvider({ apiKey: "cc-key" });
+
+  assert.deepEqual(result, { valid: true, error: null });
 });
 
 test("specialty providers surface network failures and non-auth upstream failures", async () => {
@@ -216,14 +264,20 @@ test("gitlab specialty validator treats 401 as invalid PAT", async () => {
 
 test("web-cookie provider validators accept valid Grok, Perplexity, Blackbox and Muse Spark session cookies", async () => {
   const calls = [];
+
+  // Perplexity now uses tlsFetchPerplexity (TLS-impersonating client) instead of globalThis.fetch
+  // to bypass Cloudflare Enterprise. Use the test-only override hook to intercept calls.
+  let pplxTlsCall: { url: string; options: Record<string, unknown> } | null = null;
+  __setPplxTlsFetchOverride(async (url, options) => {
+    pplxTlsCall = { url, options };
+    return { status: 200, headers: new Headers(), text: null, body: null };
+  });
+
   globalThis.fetch = async (url, init = {}) => {
     const target = String(url);
     calls.push({ url: target, init });
 
     if (target.includes("grok.com/rest/app-chat/conversations/new")) {
-      return new Response(JSON.stringify({ ok: true }), { status: 200 });
-    }
-    if (target.includes("perplexity.ai/rest/sse/perplexity_ask")) {
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
     }
     if (target.includes("app.blackbox.ai/api/auth/session")) {
@@ -276,9 +330,6 @@ test("web-cookie provider validators accept valid Grok, Perplexity, Blackbox and
   const grokCall = calls.find((call) =>
     call.url.includes("grok.com/rest/app-chat/conversations/new")
   );
-  const perplexityCall = calls.find((call) =>
-    call.url.includes("perplexity.ai/rest/sse/perplexity_ask")
-  );
   const blackboxSessionCall = calls.find((call) =>
     call.url.includes("app.blackbox.ai/api/auth/session")
   );
@@ -289,10 +340,17 @@ test("web-cookie provider validators accept valid Grok, Perplexity, Blackbox and
 
   assert.equal(grokCall?.init.headers.Cookie, "sso=grok-cookie");
   const grokBody = JSON.parse(String(grokCall?.init.body || "{}"));
-  assert.equal(grokBody.modeId, "auto");
+  assert.equal(grokBody.modeId, "fast");
   assert.equal("modelName" in grokBody, false);
   assert.equal("modelMode" in grokBody, false);
-  assert.equal(perplexityCall?.init.headers.Cookie, "__Secure-next-auth.session-token=pplx-cookie");
+  // Perplexity goes through tlsFetchPerplexity (TLS override), not globalThis.fetch.
+  // options.headers is a plain object; the validator sets Cookie from the session token.
+  assert.ok(pplxTlsCall, "perplexity TLS override was called");
+  assert.ok(pplxTlsCall!.url.includes("perplexity.ai/rest/sse/perplexity_ask"));
+  assert.equal(
+    (pplxTlsCall!.options.headers as Record<string, string>)["Cookie"],
+    "__Secure-next-auth.session-token=pplx-cookie"
+  );
   assert.equal(blackboxSessionCall?.init.headers.Cookie, "__Secure-authjs.session-token=bb-cookie");
   assert.equal(
     blackboxSubscriptionCall?.init.headers.Cookie,
@@ -303,13 +361,16 @@ test("web-cookie provider validators accept valid Grok, Perplexity, Blackbox and
 });
 
 test("web-cookie provider validators surface auth and subscription failures", async () => {
+  // Perplexity uses tlsFetchPerplexity (TLS-impersonating client). Return 403 to simulate
+  // an invalid session cookie so the validator emits the expected error message.
+  __setPplxTlsFetchOverride(async () => {
+    return { status: 403, headers: new Headers(), text: null, body: null };
+  });
+
   globalThis.fetch = async (url, init = {}) => {
     const target = String(url);
     if (target.includes("grok.com/rest/app-chat/conversations/new")) {
       return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
-    }
-    if (target.includes("perplexity.ai/rest/sse/perplexity_ask")) {
-      return new Response(JSON.stringify({ error: "forbidden" }), { status: 403 });
     }
     if (target.includes("app.blackbox.ai/api/auth/session")) {
       const cookie = (init.headers as Record<string, string>)?.Cookie || "";
@@ -367,6 +428,249 @@ test("web-cookie provider validators surface auth and subscription failures", as
   assert.match(blackboxExpired.error || "", /Invalid Blackbox session cookie/i);
   assert.match(blackboxNoSubscription.error || "", /no active paid subscription/i);
   assert.match(museSpark.error || "", /Invalid Meta AI session cookie/i);
+});
+
+test("grok-web validator: full DevTools cookie blob is parsed for the sso value", async () => {
+  let capturedCookie = "";
+  globalThis.fetch = async (url, init = {}) => {
+    const target = String(url);
+    if (target.includes("grok.com/rest/app-chat/conversations/new")) {
+      capturedCookie = ((init.headers as Record<string, string>) || {}).Cookie || "";
+      return new Response(JSON.stringify({ result: { conversation: {} } }), { status: 200 });
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const blob = "i18nextLng=en; stblid=foo; __cf_bm=bar; sso=eyJTARGET.abc.def; cf_clearance=baz;";
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: blob });
+
+  assert.equal(result.valid, true);
+  assert.equal(capturedCookie, "sso=eyJTARGET.abc.def");
+});
+
+test("grok-web validator: empty/missing sso in input returns 'Missing sso cookie'", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("validator should short-circuit before fetching");
+  };
+  const result = await validateProviderApiKey({
+    provider: "grok-web",
+    apiKey: "foo=1; bar=2;",
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Missing sso cookie/i);
+});
+
+test("grok-web validator: non-auth 403 is reported as failure with upstream body, not silently passed", async () => {
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes("grok.com/rest/app-chat/conversations/new")) {
+      return new Response(
+        JSON.stringify({ error: { code: 7, message: "Model is not found", details: [] } }),
+        { status: 403 }
+      );
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "good-cookie" });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Grok rejected validation \(403\)/);
+  assert.match(result.error || "", /Model is not found/);
+});
+
+test("grok-web validator: generic 403 forbidden is rejected, not silently passed", async () => {
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes("grok.com/rest/app-chat/conversations/new")) {
+      return new Response("Forbidden", { status: 403 });
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "any-cookie" });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Grok rejected validation \(403\)/);
+});
+
+test("grok-web validator: 403 with credential-rejection body is treated as auth-failed", async () => {
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes("grok.com/rest/app-chat/conversations/new")) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: 16,
+            message: "Failed to look up session ID. [WKE=unauthenticated:invalid-credentials]",
+            details: [],
+          },
+        }),
+        { status: 403 }
+      );
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "bad-cookie" });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Invalid SSO cookie/i);
+});
+
+// ─── chatgpt-web validator ──────────────────────────────────────────────────
+// Mocks the TLS-impersonating fetch so unit tests don't need the native binding.
+
+const { __setTlsFetchOverrideForTesting } =
+  await import("../../open-sse/services/chatgptTlsClient.ts");
+
+function makeTlsResponse(status: number, body: string, headers: Record<string, string> = {}): any {
+  const h = new Headers();
+  for (const [k, v] of Object.entries(headers)) h.set(k, v);
+  return { status, headers: h, text: body, body: null };
+}
+
+test.afterEach(() => {
+  __setTlsFetchOverrideForTesting(null);
+});
+
+test("chatgpt-web validator: accepts a valid session response with accessToken", async () => {
+  let captured: { url: string; opts: any } | null = null;
+  __setTlsFetchOverrideForTesting(async (url, opts) => {
+    captured = { url, opts };
+    return makeTlsResponse(
+      200,
+      JSON.stringify({ accessToken: "tok-abc", expires: "2030-01-01T00:00:00Z" }),
+      { "content-type": "application/json" }
+    );
+  });
+
+  const result = await validateProviderApiKey({
+    provider: "chatgpt-web",
+    apiKey: "__Secure-next-auth.session-token=eyJSESSION",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(captured?.url, "https://chatgpt.com/api/auth/session");
+  assert.equal(
+    (captured?.opts.headers as Record<string, string>).Cookie,
+    "__Secure-next-auth.session-token=eyJSESSION"
+  );
+});
+
+test("chatgpt-web validator: prepends session-token name to bare values", async () => {
+  let capturedCookie = "";
+  __setTlsFetchOverrideForTesting(async (_url, opts) => {
+    capturedCookie = (opts.headers as Record<string, string>).Cookie || "";
+    return makeTlsResponse(200, JSON.stringify({ accessToken: "tok" }), {
+      "content-type": "application/json",
+    });
+  });
+
+  await validateProviderApiKey({ provider: "chatgpt-web", apiKey: "eyJBARE" });
+  assert.equal(capturedCookie, "__Secure-next-auth.session-token=eyJBARE");
+});
+
+test("chatgpt-web validator: passes full DevTools cookie blob through verbatim", async () => {
+  let capturedCookie = "";
+  __setTlsFetchOverrideForTesting(async (_url, opts) => {
+    capturedCookie = (opts.headers as Record<string, string>).Cookie || "";
+    return makeTlsResponse(200, JSON.stringify({ accessToken: "tok" }), {
+      "content-type": "application/json",
+    });
+  });
+
+  const blob =
+    "Cookie: oai-did=foo; __Secure-next-auth.session-token.0=eyJchunk0; __Secure-next-auth.session-token.1=eyJchunk1; cf_clearance=cf123;";
+  await validateProviderApiKey({ provider: "chatgpt-web", apiKey: blob });
+  assert.equal(
+    capturedCookie,
+    "oai-did=foo; __Secure-next-auth.session-token.0=eyJchunk0; __Secure-next-auth.session-token.1=eyJchunk1; cf_clearance=cf123;"
+  );
+});
+
+test("chatgpt-web validator: 401 without cf-mitigated → invalid session cookie", async () => {
+  __setTlsFetchOverrideForTesting(async () =>
+    makeTlsResponse(401, JSON.stringify({ error: "unauthorized" }), {
+      "content-type": "application/json",
+    })
+  );
+
+  const result = await validateProviderApiKey({
+    provider: "chatgpt-web",
+    apiKey: "stale-token",
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Invalid ChatGPT session cookie/i);
+});
+
+test("chatgpt-web validator: 403 with cf-mitigated header → Cloudflare hint", async () => {
+  __setTlsFetchOverrideForTesting(async () =>
+    makeTlsResponse(403, "<html>Just a moment...</html>", {
+      "content-type": "text/html",
+      "cf-mitigated": "challenge",
+    })
+  );
+
+  const result = await validateProviderApiKey({
+    provider: "chatgpt-web",
+    apiKey: "good-but-no-cf-cookies",
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Cloudflare blocked the validator/i);
+});
+
+test("chatgpt-web validator: 200 without accessToken → session expired", async () => {
+  __setTlsFetchOverrideForTesting(async () =>
+    makeTlsResponse(200, JSON.stringify({}), { "content-type": "application/json" })
+  );
+
+  const result = await validateProviderApiKey({
+    provider: "chatgpt-web",
+    apiKey: "expired-token",
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /session expired/i);
+});
+
+test("chatgpt-web validator: 5xx → ChatGPT unavailable", async () => {
+  __setTlsFetchOverrideForTesting(async () =>
+    makeTlsResponse(503, "service unavailable", { "content-type": "text/plain" })
+  );
+
+  const result = await validateProviderApiKey({
+    provider: "chatgpt-web",
+    apiKey: "any-token",
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /ChatGPT unavailable \(503\)/);
+});
+
+test("chatgpt-web validator: 200 non-JSON content-type surfaces a cookie hint", async () => {
+  __setTlsFetchOverrideForTesting(async () =>
+    makeTlsResponse(200, "<html>blocked</html>", {
+      "content-type": "text/html",
+      "cf-ray": "ray-123",
+    })
+  );
+
+  const result = await validateProviderApiKey({
+    provider: "chatgpt-web",
+    apiKey: "any-token",
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /non-JSON.*text\/html.*cf-ray=ray-123/i);
+});
+
+test("chatgpt-web validator: TlsClientUnavailableError surfaces a clear message", async () => {
+  const { TlsClientUnavailableError } = await import("../../open-sse/services/chatgptTlsClient.ts");
+  __setTlsFetchOverrideForTesting(async () => {
+    throw new TlsClientUnavailableError("native binding failed to load");
+  });
+
+  const result = await validateProviderApiKey({
+    provider: "chatgpt-web",
+    apiKey: "any-token",
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /chatgpt-web requires this/i);
 });
 
 test("search provider validators cover success, client errors, server errors and custom user agent injection", async () => {
@@ -484,6 +788,75 @@ test("google PSE validator requires cx", async () => {
   assert.equal(result.error, "Programmable Search Engine ID (cx) is required");
 });
 
+test("Maritalk validates with Key auth against the models endpoint", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    assert.equal(String(url), "https://chat.maritaca.ai/api/models");
+    assert.equal(init.headers.Authorization, "Key maritalk-key");
+    return new Response(JSON.stringify({ data: [{ id: "sabia-4" }] }), {
+      status: 200,
+    });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "maritalk",
+    apiKey: "maritalk-key",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.method, "maritalk_models");
+  assert.equal(calls.length, 1);
+});
+
+test("Maritalk falls back to chat probe when the models endpoint is unreachable", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+
+    if (String(url) === "https://chat.maritaca.ai/api/models") {
+      return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+    }
+
+    assert.equal(String(url), "https://chat.maritaca.ai/api/chat/completions");
+    assert.equal(init.headers.Authorization, "Key maritalk-key");
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.model, "sabia-4");
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+    });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "maritalk",
+    apiKey: "maritalk-key",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(calls.length, 2);
+});
+
+test("Maritalk treats a rate-limited models probe as valid credentials", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    assert.equal(String(url), "https://chat.maritaca.ai/api/models");
+    assert.equal(init.headers.Authorization, "Key maritalk-key");
+    return new Response(JSON.stringify({ error: "rate limited" }), {
+      status: 429,
+    });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "maritalk",
+    apiKey: "maritalk-key",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.warning, "Rate limited, but credentials are valid");
+  assert.equal(calls.length, 1);
+});
+
 test("local OpenAI-style providers validate without sending Authorization when apiKey is blank", async () => {
   const originalAllowPrivateProviderUrls = process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS;
   process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS = "true";
@@ -507,21 +880,28 @@ test("local OpenAI-style providers validate without sending Authorization when a
       provider: "lemonade",
       providerSpecificData: { baseUrl: "http://localhost:13305/api/v1" },
     });
+    const llamaCpp = await validateProviderApiKey({
+      provider: "llama-cpp",
+      providerSpecificData: { baseUrl: "http://127.0.0.1:8080/v1" },
+    });
 
     assert.equal(lmStudio.valid, true);
     assert.equal(vllm.valid, true);
     assert.equal(lemonade.valid, true);
+    assert.equal(llamaCpp.valid, true);
     assert.deepEqual(
       calls.map((call) => call.url),
       [
         "http://localhost:1234/v1/models",
         "http://localhost:8000/v1/models",
         "http://localhost:13305/api/v1/models",
+        "http://127.0.0.1:8080/v1/models",
       ]
     );
     assert.equal(calls[0].headers.Authorization, undefined);
     assert.equal(calls[1].headers.Authorization, undefined);
     assert.equal(calls[2].headers.Authorization, undefined);
+    assert.equal(calls[3].headers.Authorization, undefined);
   } finally {
     if (originalAllowPrivateProviderUrls === undefined) {
       delete process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS;
@@ -1563,4 +1943,74 @@ test("specialty validator rejects invalid Runway credentials", async () => {
   });
 
   assert.equal(runway.error, "Invalid API key");
+});
+
+test("validateCommandCodeProvider sends Command Code probe URL, headers, and wrapper body", async () => {
+  const calls: any[] = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url: String(url),
+      method: init.method,
+      headers: toPlainHeaders(init.headers),
+      body: JSON.parse(String(init.body)),
+    });
+    return new Response("", { status: 400 });
+  };
+
+  const result = await validateCommandCodeProvider({
+    apiKey: "cc_test_key",
+    providerSpecificData: { validationModelId: "gpt-5.4-mini" },
+  });
+
+  assert.deepEqual(result, { valid: true, error: null });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.commandcode.ai/alpha/generate");
+  assert.equal(calls[0].method, "POST");
+  assert.equal(calls[0].headers.Authorization, "Bearer cc_test_key");
+  assert.equal(calls[0].headers["Content-Type"], "application/json");
+  assert.equal(calls[0].headers["x-command-code-version"], "0.24.1");
+  assert.equal(calls[0].headers["x-cli-environment"], "external");
+  assert.equal(calls[0].headers["x-project-slug"], "pi-cc");
+  assert.equal(calls[0].headers["x-taste-learning"], "false");
+  assert.equal(calls[0].headers["x-co-flag"], "false");
+  assert.equal(typeof calls[0].headers["x-session-id"], "string");
+  assert.equal(calls[0].body.config.environment, "external");
+  assert.equal(calls[0].body.permissionMode, "standard");
+  assert.equal(calls[0].body.skills, "");
+  assert.equal(calls[0].body.params.model, "gpt-5.4-mini");
+  assert.equal(calls[0].body.params.stream, true);
+  assert.equal(calls[0].body.params.max_tokens, 1);
+});
+
+for (const status of [400, 422, 429]) {
+  test(`validateCommandCodeProvider accepts ${status} as direct validator auth success`, async () => {
+    globalThis.fetch = async () => new Response("", { status });
+    assert.deepEqual(await validateCommandCodeProvider({ apiKey: "cc_test_key" }), {
+      valid: true,
+      error: null,
+    });
+  });
+}
+
+test("validateCommandCodeProvider rejects auth failures and provider outages", async () => {
+  globalThis.fetch = async () => new Response("unauthorized", { status: 401 });
+  assert.deepEqual(await validateCommandCodeProvider({ apiKey: "bad" }), {
+    valid: false,
+    error: "Invalid API key",
+  });
+
+  globalThis.fetch = async () => new Response("server down", { status: 500 });
+  assert.deepEqual(await validateCommandCodeProvider({ apiKey: "cc_test_key" }), {
+    valid: false,
+    error: "Provider unavailable (500)",
+  });
+});
+
+test("llama-cpp is classified as a self-hosted chat provider", async () => {
+  const { isSelfHostedChatProvider, isLocalProvider, providerAllowsOptionalApiKey } =
+    await import("../../src/shared/constants/providers.ts");
+
+  assert.equal(isSelfHostedChatProvider("llama-cpp"), true);
+  assert.equal(isLocalProvider("llama-cpp"), true);
+  assert.equal(providerAllowsOptionalApiKey("llama-cpp"), true);
 });

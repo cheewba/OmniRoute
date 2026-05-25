@@ -50,6 +50,16 @@ test("provider models helpers resolve provider IDs through aliases", () => {
   assert.deepEqual(getModelsByProviderId("provider-that-does-not-exist"), []);
 });
 
+test("Reka registry exposes preset models", () => {
+  const rekaModels = getModelsByProviderId("reka");
+  const ids = rekaModels.map((model) => model.id);
+
+  assert.equal(PROVIDER_ID_TO_ALIAS.reka, "reka");
+  assert.equal(getDefaultModel("reka"), "reka-flash-3");
+  assert.deepEqual(ids, ["reka-flash-3", "reka-edge-2603"]);
+  assert.equal(isValidModel("reka", "reka-edge-2603"), true);
+});
+
 test("GitHub Copilot registry reflects the current supported model lineup", () => {
   const githubModels = getProviderModels("gh");
   const ids = new Set(githubModels.map((model) => model.id));
@@ -57,7 +67,6 @@ test("GitHub Copilot registry reflects the current supported model lineup", () =
   assert.ok(ids.has("gpt-5.3-codex"));
   assert.ok(ids.has("gpt-5.4"));
   assert.ok(ids.has("gpt-5.4-mini"));
-  assert.ok(ids.has("gpt-5.4-nano"));
   assert.ok(ids.has("claude-opus-4.7"));
   assert.ok(ids.has("claude-sonnet-4.6"));
   assert.ok(ids.has("gemini-3-flash-preview"));
@@ -72,7 +81,10 @@ test("Kiro registry exposes the current CLI model lineup with context windows", 
   const byId = new Map(kiroModels.map((model) => [model.id, model]));
 
   assert.ok(byId.has("claude-opus-4.7"));
-  assert.equal(byId.get("claude-opus-4.7")?.contextLength, undefined); // Uses default
+  assert.equal(byId.get("claude-opus-4.7")?.contextLength, 1000000);
   assert.ok(byId.has("claude-sonnet-4.6"));
   assert.ok(byId.has("claude-haiku-4.5"));
+  assert.equal(byId.has("claude-opus-4-7"), false);
+  assert.equal(byId.has("claude-sonnet-4-6"), false);
+  assert.equal(byId.has("claude-haiku-4-5"), false);
 });

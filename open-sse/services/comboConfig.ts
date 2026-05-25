@@ -9,6 +9,7 @@ const DEFAULT_COMBO_CONFIG = {
   strategy: "priority",
   maxRetries: 1,
   retryDelayMs: 2000,
+  fallbackDelayMs: 0,
   concurrencyPerModel: 3, // max simultaneous requests per model (round-robin)
   queueTimeoutMs: 30000, // max wait time in semaphore queue (round-robin)
   handoffThreshold: 0.85,
@@ -17,6 +18,20 @@ const DEFAULT_COMBO_CONFIG = {
   maxMessagesForSummary: 30,
   maxComboDepth: 3,
   trackMetrics: true,
+  manifestRouting: false,
+  resetAwareSessionWeight: 0.35,
+  resetAwareWeeklyWeight: 0.65,
+  resetAwareTieBandPercent: 5,
+  resetAwareExhaustionGuardPercent: 10,
+  failoverBeforeRetry: false,
+  maxSetRetries: 0,
+  setRetryDelayMs: 2000,
+  // Pipeline defaults
+  pipeline_enabled: false,
+  task_detection: "pattern",
+  max_reflection_loops: 1,
+  skip_pipeline_for_tokens_under: 50,
+  pipeline_fallback: "single-provider",
 };
 
 const LEGACY_COMBO_RESILIENCE_KEYS = new Set([

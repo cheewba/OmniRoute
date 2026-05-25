@@ -14,22 +14,43 @@ export function clientWantsJsonResponse(acceptHeader: unknown): boolean {
 /**
  * Resolves stream behavior from request body + Accept header.
  * Priority: explicit `stream: true/false` in body wins.
- * Without an explicit body flag, default to non-streaming for OpenAI compatibility.
- * Only an explicit SSE Accept header should opt a request into streaming.
+ * Accept header only acts as fallback when stream is not explicitly set.
  * Fixes #656: clients sending both `stream: true` and `Accept: application/json`
  * should still get streaming responses — body intent takes precedence.
+ *
+ * Optional `sourceFormat` argument lets callers apply spec-correct defaults
+ * when both `stream` and `Accept` are ambiguous. The Anthropic Messages API
+ * defaults to non-stream when the body omits `stream`, regardless of Accept
+ * header. Without this hint, OmniRoute previously routed Anthropic /v1/messages
+ * requests with a curl-default wildcard Accept header through the streaming
+ * branch even though upstream returned JSON, producing STREAM_EARLY_EOF /
+ * HTTP 502 errors.
  */
-export function resolveStreamFlag(bodyStream: unknown, acceptHeader: unknown): boolean {
+export function resolveStreamFlag(
+  bodyStream: unknown,
+  acceptHeader: unknown,
+  sourceFormat?: string
+): boolean {
   // Explicit body value always wins
   if (bodyStream === true) return true;
   if (bodyStream === false) return false;
 
-  if (typeof acceptHeader === "string") {
-    const normalized = acceptHeader.toLowerCase();
-    if (normalized.includes("text/event-stream")) return true;
+  // Anthropic Messages API spec: stream defaults to false when body omits it.
+  // Only honor an explicit text/event-stream Accept header as a streaming opt-in
+  // for /v1/messages — otherwise default to non-stream so upstream JSON responses
+  // are surfaced correctly instead of triggering stream_early_eof.
+  if (sourceFormat === "claude") {
+    if (typeof acceptHeader === "string" && /text\/event-stream/i.test(acceptHeader)) {
+      return true;
+    }
+    return false;
   }
 
-  // No explicit stream param — preserve OpenAI-compatible default behavior.
+  if (typeof acceptHeader === "string" && /text\/event-stream/i.test(acceptHeader)) {
+    return true;
+  }
+
+  // Fork default: OpenAI-compatible requests are non-streaming unless explicit.
   return false;
 }
 

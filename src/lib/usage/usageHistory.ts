@@ -44,6 +44,11 @@ function toStringOrNull(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+function normalizeServiceTier(value: unknown): string {
+  const tier = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return tier === "priority" || tier === "fast" ? "priority" : "standard";
+}
+
 function toNumber(value: unknown): number {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim().length > 0) {
@@ -254,17 +259,42 @@ export function clearPendingRequests() {
 
 // ──────────────── getUsageDb Shim (backward compat) ────────────────
 
+const MAX_ROWS = 10000;
+
 /**
  * Returns an object compatible with the old LowDB interface.
  * Only `api/usage/analytics/route.js` uses this — it reads `db.data.history`.
+ *
+ * @param sinceIso - ISO timestamp to filter from (inclusive)
+ * @param limit - Max rows to return (default 10,000)
+ * @param cursor - Timestamp cursor for pagination (exclusive, for next page)
  */
-export async function getUsageDb(sinceIso?: string | null) {
+export async function getUsageDb(sinceIso?: string | null, limit?: number, cursor?: string | null) {
   const db = getDbInstance();
-  const rows = sinceIso
-    ? db
-        .prepare("SELECT * FROM usage_history WHERE timestamp >= ? ORDER BY timestamp ASC")
-        .all(sinceIso)
-    : db.prepare("SELECT * FROM usage_history ORDER BY timestamp ASC").all();
+  const maxRows = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Number(limit) : MAX_ROWS;
+
+  let rows;
+  if (cursor) {
+    // Cursor-based pagination (next page after cursor)
+    // Use > cursor to get rows after the last timestamp of previous page (ASC order)
+    rows = sinceIso
+      ? db
+          .prepare(
+            `SELECT * FROM usage_history WHERE timestamp >= ? AND timestamp > ? ORDER BY timestamp ASC LIMIT ?`
+          )
+          .all(sinceIso, cursor, maxRows)
+      : db
+          .prepare(`SELECT * FROM usage_history WHERE timestamp > ? ORDER BY timestamp ASC LIMIT ?`)
+          .all(cursor, maxRows);
+  } else if (sinceIso) {
+    // Initial query with date filter
+    rows = db
+      .prepare(`SELECT * FROM usage_history WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT ?`)
+      .all(sinceIso, maxRows);
+  } else {
+    // No filter - get all (with limit)
+    rows = db.prepare(`SELECT * FROM usage_history ORDER BY timestamp ASC LIMIT ?`).all(maxRows);
+  }
 
   const history = rows.map((row) => {
     const r = asRecord(row);
@@ -274,6 +304,7 @@ export async function getUsageDb(sinceIso?: string | null) {
       connectionId: toStringOrNull(r.connection_id),
       apiKeyId: toStringOrNull(r.api_key_id),
       apiKeyName: toStringOrNull(r.api_key_name),
+      serviceTier: normalizeServiceTier(r.service_tier),
       tokens: {
         input: toNumber(r.tokens_input),
         output: toNumber(r.tokens_output),
@@ -290,7 +321,10 @@ export async function getUsageDb(sinceIso?: string | null) {
     };
   });
 
-  return { data: { history } };
+  // Provide next cursor if we hit the limit (more rows exist)
+  const nextCursor = rows.length === maxRows ? (rows[rows.length - 1] as any)?.timestamp : null;
+
+  return { data: { history, nextCursor } };
 }
 
 // ──────────────── Save Request Usage ────────────────
@@ -304,13 +338,14 @@ export async function saveRequestUsage(entry: any) {
   try {
     const db = getDbInstance();
     const timestamp = entry.timestamp || new Date().toISOString();
+    const serviceTier = normalizeServiceTier(entry.serviceTier ?? entry.service_tier);
 
     db.prepare(
       `
       INSERT INTO usage_history (provider, model, connection_id, api_key_id, api_key_name,
         tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, tokens_reasoning,
-        status, success, latency_ms, ttft_ms, error_code, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        service_tier, status, success, latency_ms, ttft_ms, error_code, combo_strategy, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `
     ).run(
       entry.provider || null,
@@ -323,6 +358,7 @@ export async function saveRequestUsage(entry: any) {
       getPromptCacheReadTokens(entry.tokens),
       getPromptCacheCreationTokens(entry.tokens),
       getReasoningTokens(entry.tokens),
+      serviceTier,
       entry.status || null,
       entry.success === false ? 0 : 1,
       Number.isFinite(Number(entry.latencyMs)) ? Number(entry.latencyMs) : 0,
@@ -332,6 +368,7 @@ export async function saveRequestUsage(entry: any) {
           ? Number(entry.latencyMs)
           : 0,
       entry.errorCode || null,
+      entry.comboStrategy || entry.combo_strategy || null,
       timestamp
     );
   } catch (error) {
@@ -381,6 +418,7 @@ export async function getUsageHistory(filter: any = {}) {
       connectionId: toStringOrNull(r.connection_id),
       apiKeyId: toStringOrNull(r.api_key_id),
       apiKeyName: toStringOrNull(r.api_key_name),
+      serviceTier: normalizeServiceTier(r.service_tier),
       tokens: {
         input: toNumber(r.tokens_input),
         output: toNumber(r.tokens_output),

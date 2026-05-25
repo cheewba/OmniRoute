@@ -75,7 +75,7 @@ export function createResponsesLogger(model, logsDir = null) {
  * @param {Object} logger - Optional logger instance
  * @returns {TransformStream}
  */
-export function createResponsesApiTransformStream(logger = null) {
+export function createResponsesApiTransformStream(logger = null, keepaliveIntervalMs = 3000) {
   const state = {
     seq: 0,
     responseId: `resp_${Date.now()}`,
@@ -99,6 +99,7 @@ export function createResponsesApiTransformStream(logger = null) {
     buffer: "",
     completedSent: false,
     usage: null,
+    keepaliveTimer: null,
   };
 
   const encoder = new TextEncoder();
@@ -223,13 +224,13 @@ export function createResponsesApiTransformStream(logger = null) {
     if (callId && !state.funcItemDone[idx]) {
       let args = state.funcArgsBuf[idx] || "{}";
 
-      // Fix #1674: Final cleanup of empty string placeholders that might have been split across delta chunks
+      // Fix #1674 & #1852: Final cleanup of empty string and empty array placeholders
       try {
         const parsed = JSON.parse(args);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
           let modified = false;
           for (const [k, v] of Object.entries(parsed)) {
-            if (v === "") {
+            if (v === "" || (Array.isArray(v) && v.length === 0)) {
               delete parsed[k];
               modified = true;
             }
@@ -321,6 +322,12 @@ export function createResponsesApiTransformStream(logger = null) {
   };
 
   return new TransformStream({
+    start(controller) {
+      // Periodic keepalive heartbeat to prevent client timeouts (Codex CLI #2544)
+      state.keepaliveTimer = setInterval(() => {
+        controller.enqueue(encoder.encode(": keepalive\n\n"));
+      }, keepaliveIntervalMs);
+    },
     transform(chunk, controller) {
       const text = new TextDecoder().decode(chunk);
       logger?.logInput(text.trim());
@@ -506,12 +513,13 @@ export function createResponsesApiTransformStream(logger = null) {
               const refCallId = state.funcCallIds[tcIdx] || newCallId;
               let deltaStr = tc.function.arguments;
 
-              // Fix #1674: cx/gpt-5.5 injects empty strings for optional parameters.
-              // We strip these directly from the streaming deltas to avoid breaking strict clients like Claude Code.
-              if (deltaStr.includes('""')) {
+              // Fix #1674 & #1852: Strip empty strings and empty arrays from streaming deltas
+              if (deltaStr.includes('""') || deltaStr.includes("[]") || deltaStr.includes("[ ]")) {
                 deltaStr = deltaStr
                   .replace(/,"[a-zA-Z0-9_]+":""/g, "")
-                  .replace(/"[a-zA-Z0-9_]+":"",/g, "");
+                  .replace(/"[a-zA-Z0-9_]+":"",/g, "")
+                  .replace(/,"[a-zA-Z0-9_]+":\s*\[\s*\]/g, "")
+                  .replace(/"[a-zA-Z0-9_]+":\s*\[\s*\],?/g, "");
               }
 
               if (refCallId) {
@@ -538,6 +546,11 @@ export function createResponsesApiTransformStream(logger = null) {
     },
 
     flush(controller) {
+      // Clear keepalive timer
+      if (state.keepaliveTimer) {
+        clearInterval(state.keepaliveTimer);
+        state.keepaliveTimer = null;
+      }
       for (const i in state.msgItemAdded) closeMessage(controller, i);
       closeReasoning(controller);
       for (const i in state.funcCallIds) closeToolCall(controller, i);

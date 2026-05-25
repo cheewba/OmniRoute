@@ -34,6 +34,7 @@ function createLog() {
     info: (tag: any, msg: any) => entries.push({ level: "info", tag, msg }),
     warn: (tag: any, msg: any) => entries.push({ level: "warn", tag, msg }),
     error: (tag: any, msg: any) => entries.push({ level: "error", tag, msg }),
+    debug: (tag: any, msg: any) => entries.push({ level: "debug", tag, msg }),
     entries,
   };
 }
@@ -427,6 +428,73 @@ test("handleComboChat random strategy uses shuffled model order", async () => {
 
     assert.equal(calls.length, 1);
     assert.notEqual(calls[0], "model-a");
+  } finally {
+    Math.random = originalRandom;
+  }
+});
+
+test("handleComboChat fill-first explicitly preserves priority order", async () => {
+  const calls: any[] = [];
+
+  await handleComboChat({
+    body: {},
+    combo: {
+      name: "fill-first-order",
+      strategy: "fill-first",
+      models: ["model-a", "model-b"],
+    },
+    handleSingleModel: async (_body: any, modelStr: any) => {
+      calls.push(modelStr);
+      return okResponse();
+    },
+    isModelAvailable: async () => true,
+    log: createLog(),
+    settings: null,
+    relayOptions: null as any,
+    allCombos: null,
+  });
+
+  assert.deepEqual(calls, ["model-a"]);
+});
+
+test("handleComboChat p2c selects the better of two random choices by metrics", async () => {
+  const originalRandom = Math.random;
+  const calls: any[] = [];
+  const sequence = [0.0, 0.0];
+  let idx = 0;
+
+  recordComboRequest("p2c-combo", "model-a", {
+    success: true,
+    latencyMs: 2000,
+    strategy: "p2c",
+  });
+  recordComboRequest("p2c-combo", "model-b", {
+    success: true,
+    latencyMs: 20,
+    strategy: "p2c",
+  });
+  Math.random = () => sequence[idx++] ?? 0;
+
+  try {
+    await handleComboChat({
+      body: {},
+      combo: {
+        name: "p2c-combo",
+        strategy: "p2c",
+        models: ["model-a", "model-b", "model-c"],
+      },
+      handleSingleModel: async (_body: any, modelStr: any) => {
+        calls.push(modelStr);
+        return okResponse();
+      },
+      isModelAvailable: async () => true,
+      log: createLog(),
+      settings: null,
+      relayOptions: null as any,
+      allCombos: null,
+    });
+
+    assert.deepEqual(calls, ["model-b"]);
   } finally {
     Math.random = originalRandom;
   }
@@ -1318,6 +1386,59 @@ test("handleComboChat context-optimized orders models by the largest synced cont
   assert.equal(calls[0], "openai/gpt-4o-max");
 });
 
+test("handleComboChat context-optimized preserves order when all context limits are unknown", async () => {
+  const calls: any[] = [];
+  const result = await handleComboChat({
+    body: {},
+    combo: {
+      name: "context-optimized-unknown",
+      strategy: "context-optimized",
+      models: ["unknown/model-a", "unknown/model-b"],
+    },
+    handleSingleModel: async (_body: any, modelStr: any) => {
+      calls.push(modelStr);
+      return okResponse();
+    },
+    isModelAvailable: async () => true,
+    log: createLog(),
+    settings: null,
+    relayOptions: null as any,
+    allCombos: null,
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, ["unknown/model-a"]);
+});
+
+test("handleComboChat normalizes legacy strategy names at runtime", async () => {
+  const usageCalls: any[] = [];
+  recordComboRequest("legacy-usage-combo", "model-a", {
+    success: true,
+    latencyMs: 100,
+    strategy: "least-used",
+  });
+
+  await handleComboChat({
+    body: {},
+    combo: {
+      name: "legacy-usage-combo",
+      strategy: "usage",
+      models: ["model-a", "model-b"],
+    },
+    handleSingleModel: async (_body: any, modelStr: any) => {
+      usageCalls.push(modelStr);
+      return okResponse();
+    },
+    isModelAvailable: async () => true,
+    log: createLog(),
+    settings: null,
+    relayOptions: null as any,
+    allCombos: null,
+  });
+
+  assert.deepEqual(usageCalls, ["model-b"]);
+});
+
 test("handleComboChat returns a 503 when every model is unavailable before execution", async () => {
   const result = await handleComboChat({
     body: {},
@@ -1383,7 +1504,7 @@ test("handleComboChat auto strategy honors LKGP after filtering to tool-capable 
       name: "auto-lkgp",
       strategy: "auto",
       models: ["openai/gpt-oss-120b", "openai/gpt-4o-mini", "claude/claude-sonnet-4-6"],
-      autoConfig: { routingStrategy: "lkgp" },
+      autoConfig: { routerStrategy: "lkgp" },
     },
     handleSingleModel: async (_body: any, modelStr: any) => {
       calls.push(modelStr);
@@ -1469,13 +1590,17 @@ test("handleComboChat standalone lkgp strategy updates LKGP after a successful c
     allCombos: null,
   });
 
+  // Give the async fire-and-forget LKGP update a chance to execute
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
   const persistedProvider = await settingsDb.getLKGP(
     "standalone-lkgp-save",
     "standalone-lkgp-save"
   );
 
   assert.equal(result.ok, true);
-  assert.equal(persistedProvider, "openai");
+  // getLKGP now returns LKGPRecord | null — source: src/lib/db/settings.ts getLKGP()
+  assert.equal(persistedProvider?.provider, "openai");
 });
 
 test("handleComboChat auto strategy falls back to the full pool when tool filtering empties candidates", async () => {
@@ -1498,7 +1623,7 @@ test("handleComboChat auto strategy falls back to the full pool when tool filter
       name: "auto-cost-fallback",
       strategy: "auto",
       models: ["openai/gpt-oss-120b", "deepseek/reasoner"],
-      autoConfig: { routingStrategy: "cost" },
+      autoConfig: { routerStrategy: "cost" },
     },
     handleSingleModel: async (_body: any, modelStr: any) => {
       calls.push(modelStr);
@@ -1535,7 +1660,7 @@ test("handleComboChat auto strategy falls back to rules when a custom router str
       name: "auto-throwing-strategy",
       strategy: "auto",
       models: ["openai/gpt-4o-mini"],
-      autoConfig: { routingStrategy: "throwing-test" },
+      autoConfig: { routerStrategy: "throwing-test" },
     },
     handleSingleModel: async (_body: any, modelStr: any) => {
       calls.push(modelStr);
@@ -1639,7 +1764,7 @@ test("handleComboChat context cache protection pins the model and tags tool-call
   );
 });
 
-test("handleComboChat context cache protection sanitizes streamed text tags from client output", async () => {
+test("handleComboChat context cache protection preserves omniModel tag in streamed output for round-trip pinning", async () => {
   const result = await handleComboChat({
     body: { stream: true, messages: [{ role: "user", content: "stream it" }] },
     combo: {
@@ -1665,7 +1790,7 @@ test("handleComboChat context cache protection sanitizes streamed text tags from
   assert.equal(result.ok, true);
   assert.equal(result.headers.get("X-OmniRoute-Model"), "openai/gpt-4o-mini");
   assert.match(text, /hello world/);
-  assert.doesNotMatch(text, /<omniModel>/);
+  assert.match(text, /<omniModel>openai\/gpt-4o-mini<\/omniModel>/);
 });
 
 test("handleComboChat context cache protection injects a hidden tag for tool-call-only streams", async () => {
@@ -1693,7 +1818,7 @@ test("handleComboChat context cache protection injects a hidden tag for tool-cal
   const text = await result.text();
   assert.equal(result.ok, true);
   assert.match(text, /"finish_reason":"tool_calls"/);
-  assert.doesNotMatch(text, /<omniModel>/);
+  assert.match(text, /<omniModel>openai\/gpt-4o-mini<\/omniModel>/);
 });
 
 test("handleComboChat context cache protection flushes cleanly when a stream ends without content", async () => {
@@ -1717,8 +1842,7 @@ test("handleComboChat context cache protection flushes cleanly when a stream end
   assert.equal(result.ok, true);
   assert.equal(result.headers.get("X-OmniRoute-Model"), "openai/gpt-4o-mini");
   assert.match(text, /data: \[DONE\]/);
-  assert.match(text, /"content":""/);
-  assert.doesNotMatch(text, /<omniModel>/);
+  assert.match(text, /"content":"<omniModel>openai\/gpt-4o-mini<\/omniModel>"/);
 });
 
 test("handleComboChat round-robin resolves nested combos and returns inactive when every target is skipped", async () => {
@@ -1937,17 +2061,19 @@ test("handleComboChat falls back to next model when first model returns all-acco
 test("handleComboChat round-robin falls back when all-accounts-rate-limited 503 is returned", async () => {
   const calls: any[] = [];
 
+  // Use distinct provider prefixes so #1731 exhaustedProviders does not block model-b
+  // (getTargetProvider("openai/model-a") → "openai"; getTargetProvider("anthropic/model-b") → "anthropic")
   const result = await handleComboChat({
     body: {},
     combo: {
       name: "rr-all-accounts-rate-limited",
       strategy: "round-robin",
-      models: ["model-a", "model-b"],
+      models: ["openai/model-a", "anthropic/model-b"],
       config: { maxRetries: 0, retryDelayMs: 1, concurrencyPerModel: 1, queueTimeoutMs: 5 },
     },
     handleSingleModel: async (_body: any, modelStr: any) => {
       calls.push(modelStr);
-      if (modelStr === "model-b") {
+      if (modelStr === "anthropic/model-b") {
         return okResponse({ choices: [{ message: { content: "ok" } }] });
       }
       // Simulate all accounts rate-limited — handleNoCredentials signal
@@ -1968,7 +2094,7 @@ test("handleComboChat round-robin falls back when all-accounts-rate-limited 503 
 
   const payload = (await result.json()) as any;
   assert.equal(result.ok, true);
-  assert.deepEqual(calls, ["model-a", "model-b"]);
+  assert.deepEqual(calls, ["openai/model-a", "anthropic/model-b"]);
   assert.equal(payload.choices[0].message.content, "ok");
 });
 

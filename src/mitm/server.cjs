@@ -13,8 +13,18 @@ function getDataDir() {
 }
 
 // Configuration
-const TARGET_HOST = "daily-cloudcode-pa.googleapis.com";
-const LOCAL_PORT = 443;
+// Keep in sync with src/mitm/targets/antigravity.ts
+const TARGET_HOSTS = new Set([
+  "daily-cloudcode-pa.sandbox.googleapis.com",
+  "daily-cloudcode-pa.googleapis.com",
+  "cloudcode-pa.googleapis.com",
+  "autopush-cloudcode-pa.sandbox.googleapis.com",
+]);
+const parsedLocalPort = Number.parseInt(process.env.MITM_LOCAL_PORT || "443", 10);
+const LOCAL_PORT =
+  Number.isInteger(parsedLocalPort) && parsedLocalPort > 0 && parsedLocalPort <= 65535
+    ? parsedLocalPort
+    : 443;
 const ROUTER_BASE_URL = (
   process.env.OMNIROUTE_BASE_URL ||
   process.env.BASE_URL ||
@@ -40,6 +50,24 @@ if (!API_KEY) {
 
 // Load SSL certificates
 const certDir = path.join(DATA_DIR, "mitm");
+const STATS_FILE = path.join(certDir, "stats.json");
+const stats = {
+  startedAt: null,
+  totalRequests: 0,
+  interceptedRequests: 0,
+  activeConnections: 0,
+  lastRequestAt: null,
+  lastInterceptAt: null,
+};
+
+function writeStats() {
+  try {
+    fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+  } catch {
+    // Stats are best-effort and should not affect proxy traffic.
+  }
+}
+
 const sslOptions = {
   key: fs.readFileSync(path.join(certDir, "server.key")),
   cert: fs.readFileSync(path.join(certDir, "server.crt")),
@@ -90,15 +118,23 @@ function saveResponseLog(url, data) {
 }
 
 // Resolve real IP of target host (bypass /etc/hosts)
-let cachedTargetIP = null;
-async function resolveTargetIP() {
-  if (cachedTargetIP) return cachedTargetIP;
+const cachedTargetIPs = new Map();
+function getTargetHost(req) {
+  const host = String(req.headers.host || "")
+    .split(":")[0]
+    .toLowerCase();
+  return TARGET_HOSTS.has(host) ? host : "daily-cloudcode-pa.sandbox.googleapis.com";
+}
+
+async function resolveTargetIP(targetHost) {
+  if (cachedTargetIPs.has(targetHost)) return cachedTargetIPs.get(targetHost);
   const resolver = new dns.Resolver();
   resolver.setServers(["8.8.8.8"]);
   const resolve4 = promisify(resolver.resolve4.bind(resolver));
-  const addresses = await resolve4(TARGET_HOST);
-  cachedTargetIP = addresses[0];
-  return cachedTargetIP;
+  const addresses = await resolve4(targetHost);
+  const targetIP = addresses[0];
+  cachedTargetIPs.set(targetHost, targetIP);
+  return targetIP;
 }
 
 function collectBodyRaw(req) {
@@ -171,7 +207,8 @@ function getMappedModel(model) {
 }
 
 async function passthrough(req, res, bodyBuffer) {
-  const targetIP = await resolveTargetIP();
+  const targetHost = getTargetHost(req);
+  const targetIP = await resolveTargetIP(targetHost);
 
   // TLS validation is enabled by default. Set MITM_DISABLE_TLS_VERIFY=1 only
   // in controlled local environments where the target uses a self-signed cert.
@@ -183,8 +220,8 @@ async function passthrough(req, res, bodyBuffer) {
       port: 443,
       path: req.url,
       method: req.method,
-      headers: { ...req.headers, host: TARGET_HOST },
-      servername: TARGET_HOST,
+      headers: { ...req.headers, host: targetHost },
+      servername: targetHost,
       rejectUnauthorized,
     },
     (forwardRes) => {
@@ -248,35 +285,63 @@ async function intercept(req, res, bodyBuffer, mappedModel) {
 }
 
 const server = https.createServer(sslOptions, async (req, res) => {
-  const bodyBuffer = await collectBodyRaw(req);
+  stats.totalRequests++;
+  stats.lastRequestAt = new Date().toISOString();
+  writeStats();
 
-  // Save request log if enabled
+  const bodyBuffer = await collectBodyRaw(req);
+  const host = String(req.headers.host || "").split(":")[0].toLowerCase();
+  const model = bodyBuffer.length > 0 ? extractModel(bodyBuffer) : null;
+
+  console.log(`[MITM] ${req.method} ${host}${req.url} | body: ${bodyBuffer.length}B | model: ${model || "N/A"}`);
+
   if (bodyBuffer.length > 0) saveRequestLog(req.url, bodyBuffer);
 
-  // Anti-loop: requests from OmniRoute bypass interception
   if (req.headers["x-omniroute-source"] === "omniroute") {
+    console.log(`[MITM] → PASSTHROUGH (OmniRoute source loop)`);
+    return passthrough(req, res, bodyBuffer);
+  }
+
+  if (!TARGET_HOSTS.has(host)) {
+    console.log(`[MITM] → PASSTHROUGH (host ${host} not in target list)`);
     return passthrough(req, res, bodyBuffer);
   }
 
   const isChatRequest = CHAT_URL_PATTERNS.some((p) => req.url.includes(p));
 
   if (!isChatRequest) {
+    console.log(`[MITM] → PASSTHROUGH (URL ${req.url} does not match chat patterns)`);
     return passthrough(req, res, bodyBuffer);
   }
 
-  const model = extractModel(bodyBuffer);
   const mappedModel = getMappedModel(model);
 
   if (!mappedModel) {
+    console.log(`[MITM] → PASSTHROUGH (model "${model}" has no MITM alias mapping)`);
     return passthrough(req, res, bodyBuffer);
   }
 
-  console.log(`🔀 ${model} → ${mappedModel}`);
+  stats.interceptedRequests++;
+  stats.lastInterceptAt = new Date().toISOString();
+  writeStats();
+
+  console.log(`[MITM] INTERCEPTED ${model} → ${mappedModel}`);
   return intercept(req, res, bodyBuffer, mappedModel);
 });
 
 server.listen(LOCAL_PORT, () => {
+  stats.startedAt = new Date().toISOString();
+  writeStats();
   console.log(`🚀 MITM ready on :${LOCAL_PORT} → ${ROUTER_URL}`);
+});
+
+server.on("connection", (socket) => {
+  stats.activeConnections++;
+  writeStats();
+  socket.on("close", () => {
+    stats.activeConnections = Math.max(0, stats.activeConnections - 1);
+    writeStats();
+  });
 });
 
 server.on("error", (error) => {

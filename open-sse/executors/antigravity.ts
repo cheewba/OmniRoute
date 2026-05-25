@@ -1,8 +1,25 @@
 import crypto, { randomUUID } from "crypto";
-import { BaseExecutor, mergeUpstreamExtraHeaders, type ExecuteInput } from "./base.ts";
-import { PROVIDERS, OAUTH_ENDPOINTS, HTTP_STATUS } from "../config/constants.ts";
+import {
+  BaseExecutor,
+  mergeAbortSignals,
+  mergeUpstreamExtraHeaders,
+  type ExecuteInput,
+  type ExecutorLog,
+  type ProviderCredentials,
+} from "./base.ts";
+import { applyFingerprint, isCliCompatEnabled } from "../config/cliFingerprints.ts";
+import {
+  PROVIDERS,
+  OAUTH_ENDPOINTS,
+  HTTP_STATUS,
+  STREAM_READINESS_TIMEOUT_MS,
+  ANTIGRAVITY_PRE_RESPONSE_TIMEOUT_CODE,
+} from "../config/constants.ts";
 import { scrubProxyAndFingerprintHeaders } from "../services/antigravityHeaderScrub.ts";
-import { antigravityUserAgent } from "../services/antigravityHeaders.ts";
+import {
+  antigravityNativeOAuthUserAgent,
+  antigravityUserAgent,
+} from "../services/antigravityHeaders.ts";
 import { classify429, decide429, type Decision } from "../services/antigravity429Engine.ts";
 import {
   injectCreditsField,
@@ -14,18 +31,94 @@ import {
 import { persistCreditBalance, getAllPersistedCreditBalances } from "@/lib/db/creditBalance";
 import { obfuscateSensitiveWords } from "../services/antigravityObfuscation.ts";
 import { resolveAntigravityVersion } from "../services/antigravityVersion.ts";
+import { ensureAntigravityProjectAssigned } from "../services/antigravityProjectBootstrap.ts";
 import { resolveAntigravityModelId } from "../config/antigravityModelAliases.ts";
 import { cloakAntigravityToolPayload } from "../config/toolCloaking.ts";
 import {
   shouldStripCloudCodeThinking,
   stripCloudCodeThinkingConfig,
 } from "../services/cloudCodeThinking.ts";
+import { buildGeminiTools } from "../translator/helpers/geminiToolsSanitizer.ts";
+import {
+  applyAntigravityClientProfileHeaders,
+  removeHeaderCaseInsensitive,
+} from "../services/antigravityClientProfile.ts";
+import {
+  generateAntigravityRequestId,
+  getAntigravityEnvelopeUserAgent,
+  getAntigravitySessionId,
+} from "../services/antigravityIdentity.ts";
 
 const MAX_RETRY_AFTER_MS = 60_000;
 const LONG_RETRY_THRESHOLD_MS = 60_000;
 const CREDITS_EXHAUSTED_TTL_MS = 5 * 60 * 60 * 1000; // 5 hours
-
 const BARE_PRO_IDS = new Set(["gemini-3.1-pro"]);
+
+interface AntigravityContent {
+  role: string;
+  parts: unknown[];
+  [key: string]: unknown;
+}
+
+type AntigravityCredentials = ProviderCredentials & {
+  projectId?: string | null;
+  expiresIn?: number;
+};
+
+type AntigravityChunkContent = Record<string, unknown> & {
+  role?: string;
+  parts?: Array<
+    Record<string, unknown> & {
+      text?: unknown;
+      functionCall?: Record<string, unknown>;
+      functionResponse?: unknown;
+      thought?: unknown;
+      thoughtSignature?: unknown;
+    }
+  >;
+};
+
+type AntigravityCreditEntry = {
+  creditType?: string;
+  creditAmount?: string;
+};
+
+function getChunkedOrFixedBody(bodyStr: string, stream: boolean): BodyInit {
+  if (stream) {
+    return new ReadableStream({
+      async start(controller) {
+        controller.enqueue(new TextEncoder().encode(bodyStr));
+        controller.close();
+      },
+    });
+  }
+  return bodyStr;
+}
+
+function cloneAntigravityRequestBody(body: unknown): unknown {
+  if (!body || typeof body !== "object") {
+    return body;
+  }
+
+  try {
+    return structuredClone(body);
+  } catch {
+    return JSON.parse(JSON.stringify(body));
+  }
+}
+
+function serializeAntigravityRequest(
+  provider: string,
+  headers: Record<string, string>,
+  body: unknown
+): { headers: Record<string, string>; bodyString: string } {
+  const serializedBody = cloneAntigravityRequestBody(body);
+
+  if (!isCliCompatEnabled(provider)) {
+    return { headers, bodyString: JSON.stringify(serializedBody) };
+  }
+  return applyFingerprint(provider, { ...headers }, serializedBody);
+}
 
 type AntigravityCollectedStream = {
   textContent: string;
@@ -33,6 +126,36 @@ type AntigravityCollectedStream = {
   usage: Record<string, unknown> | null;
   remainingCredits: Array<{ creditType: string; creditAmount: string }> | null;
 };
+
+type AntigravityRequestEnvelope = Record<string, unknown> & {
+  project: string;
+  model: string;
+  userAgent: "antigravity" | "jetski";
+  requestType: "agent" | "image_gen";
+  requestId: string;
+  request: Record<string, unknown>;
+  enabledCreditTypes?: string[];
+};
+
+class AntigravityPreResponseTimeoutError extends Error {
+  code = ANTIGRAVITY_PRE_RESPONSE_TIMEOUT_CODE;
+  status = HTTP_STATUS.GATEWAY_TIMEOUT;
+
+  constructor(timeoutMs: number, url: string) {
+    super(`Antigravity upstream did not return response headers within ${timeoutMs}ms: ${url}`);
+    this.name = "TimeoutError";
+  }
+}
+
+function getAbortErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const value = (error as { code?: unknown }).code;
+  return typeof value === "string" ? value : null;
+}
+
+function isAntigravityPreResponseTimeout(error: unknown): boolean {
+  return getAbortErrorCode(error) === ANTIGRAVITY_PRE_RESPONSE_TIMEOUT_CODE;
+}
 
 /**
  * Per-account GOOGLE_ONE_AI credits-exhausted tracker.
@@ -195,12 +318,86 @@ function attachToolNameMap<T>(payload: T, toolNameMap: Map<string, string> | nul
   return copy;
 }
 
+function getRequestTargetModel(body: Record<string, unknown>): string {
+  const target = body.model;
+  return typeof target === "string" && target.length > 0 ? target : "unknown";
+}
+
+function applyAntigravityGenerationDefaults(request: Record<string, unknown>): void {
+  const generationConfig =
+    request.generationConfig && typeof request.generationConfig === "object"
+      ? (request.generationConfig as Record<string, unknown>)
+      : {};
+
+  if (generationConfig.topK === undefined) {
+    generationConfig.topK = 40;
+  }
+  if (generationConfig.topP === undefined) {
+    generationConfig.topP = 1.0;
+  }
+
+  const thinkingConfig =
+    generationConfig.thinkingConfig && typeof generationConfig.thinkingConfig === "object"
+      ? (generationConfig.thinkingConfig as Record<string, unknown>)
+      : null;
+  const thinkingBudget = Number(thinkingConfig?.thinkingBudget);
+  const maxOutputTokens = Number(generationConfig.maxOutputTokens);
+  if (
+    Number.isFinite(thinkingBudget) &&
+    thinkingBudget > 0 &&
+    (!Number.isFinite(maxOutputTokens) || maxOutputTokens <= thinkingBudget)
+  ) {
+    generationConfig.maxOutputTokens = Math.floor(thinkingBudget) + 1;
+  }
+
+  request.generationConfig = generationConfig;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function sanitizeAntigravityGeminiRequest(
+  request: Record<string, unknown>
+): Record<string, unknown> {
+  const clean: Record<string, unknown> = {};
+
+  if (Array.isArray(request.contents)) {
+    clean.contents = request.contents;
+  }
+
+  if (asRecord(request.systemInstruction)) {
+    clean.systemInstruction = request.systemInstruction;
+  }
+
+  clean.generationConfig = asRecord(request.generationConfig)
+    ? { ...(request.generationConfig as Record<string, unknown>) }
+    : {};
+
+  const geminiTools = buildGeminiTools(request.tools);
+  if (geminiTools) {
+    clean.tools = geminiTools;
+    clean.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
+  } else if (asRecord(request.toolConfig)) {
+    clean.toolConfig = request.toolConfig;
+  }
+
+  if (typeof request.sessionId === "string") {
+    clean.sessionId = request.sessionId;
+  }
+
+  return clean;
+}
+
 export class AntigravityExecutor extends BaseExecutor {
   constructor() {
     super("antigravity", PROVIDERS.antigravity);
   }
 
-  buildUrl(model, stream, urlIndex = 0) {
+  buildUrl(model: string, _stream: boolean, urlIndex = 0): string {
+    void model;
     const baseUrls = this.getBaseUrls();
     const baseUrl = baseUrls[urlIndex] || baseUrls[0];
     // Always use streaming endpoint — the non-streaming `generateContent` causes
@@ -211,7 +408,7 @@ export class AntigravityExecutor extends BaseExecutor {
     return `${baseUrl}/v1internal:streamGenerateContent?alt=sse`;
   }
 
-  buildHeaders(credentials, stream = true) {
+  buildHeaders(credentials: AntigravityCredentials, _stream = true): Record<string, string> {
     const raw = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${credentials.accessToken}`,
@@ -223,27 +420,53 @@ export class AntigravityExecutor extends BaseExecutor {
     return scrubProxyAndFingerprintHeaders(raw);
   }
 
-  transformRequest(model, body, stream, credentials) {
-    // TODO: Consider removing project override like gemini-cli.ts — stored projectId
-    // can become stale for Cloud Code accounts, causing 403 "has not been used in project X".
-    // Antigravity accounts may have more stable project IDs, but the risk exists.
-    const bodyProjectId = body?.project;
-    const credentialsProjectId = credentials?.projectId;
+  async transformRequest(
+    model: string,
+    body: unknown,
+    _stream: boolean,
+    credentials: AntigravityCredentials
+  ): Promise<AntigravityRequestEnvelope | Response> {
+    // Project ID resolution: prefer OAuth-stored projectId over incoming body.project
+    // to avoid stale/wrong client-side values causing 404/403 from Cloud Code endpoints.
+    // Opt-in escape hatch: set OMNIROUTER_ALLOW_BODY_PROJECT_OVERRIDE=1.
+    const normalizeProjectId = (value: unknown): string | null => {
+      if (typeof value !== "string") return null;
+      const trimmedValue = value.trim();
+      return trimmedValue ? trimmedValue : null;
+    };
+    const bodyRecord = asRecord(body) ?? {};
+    const bodyProjectId = normalizeProjectId(bodyRecord.project);
+    const credentialsProjectId = normalizeProjectId(credentials?.projectId);
+    const providerSpecificProjectId = normalizeProjectId(
+      (credentials?.providerSpecificData as Record<string, unknown> | undefined)?.projectId
+    );
     const allowBodyProjectOverride = process.env.OMNIROUTE_ALLOW_BODY_PROJECT_OVERRIDE === "1";
 
     // Default: prefer OAuth-stored projectId over incoming body.project to avoid
     // stale/wrong client-side values causing 404/403 from Cloud Code endpoints.
     // Opt-in escape hatch: set OMNIROUTE_ALLOW_BODY_PROJECT_OVERRIDE=1.
-    const projectId =
+    let projectId =
       allowBodyProjectOverride && bodyProjectId
         ? bodyProjectId
-        : credentialsProjectId || bodyProjectId;
+        : credentialsProjectId || providerSpecificProjectId || bodyProjectId;
+
+    // Auto-discover a missing projectId via loadCodeAssist before failing (#2334/#2541).
+    // A freshly re-added Antigravity account can have an empty stored projectId even when
+    // its Google account already owns a Cloud Code project (the OAuth-time loadCodeAssist
+    // returned empty/transiently failed). Mirror gemini-cli.ts's bootstrap to recover it
+    // here — the helper memoizes per access-token, so this is a one-time round-trip.
+    if (!projectId && credentials?.accessToken) {
+      const discovered = await ensureAntigravityProjectAssigned(credentials.accessToken);
+      if (discovered) projectId = discovered;
+    }
 
     if (!projectId) {
       // (#489) Return a structured error instead of throwing — gives the client a clear signal
       // to show a "Reconnect OAuth" prompt rather than an opaque "Internal Server Error".
       const errorMsg =
-        "Missing Google projectId for Antigravity account. Please reconnect OAuth in Providers → Antigravity so OmniRoute can fetch your Cloud Code project.";
+        "Missing Google projectId for Antigravity account. Auto-discovery via loadCodeAssist " +
+        "found no Cloud Code project. Please reconnect OAuth in Providers → Antigravity (and " +
+        "ensure the Google account has completed Gemini Code Assist onboarding).";
       const errorBody = {
         error: {
           message: errorMsg,
@@ -260,29 +483,31 @@ export class AntigravityExecutor extends BaseExecutor {
     }
 
     const upstreamModel = cleanModelName(model);
-    const baseBody = body && typeof body === "object" ? body : {};
+    const isClaude = upstreamModel.toLowerCase().includes("claude");
+    const baseBody = bodyRecord;
     const normalizedBody = shouldStripCloudCodeThinking(this.provider, upstreamModel)
       ? stripCloudCodeThinkingConfig(baseBody)
       : baseBody;
+    const normalizedRequest = asRecord(normalizedBody.request);
+    const rawContents = Array.isArray(normalizedRequest?.contents)
+      ? normalizedRequest.contents
+      : [];
 
-    // Fix contents for Claude models via Antigravity
-    const normalizedContents =
-      normalizedBody.request?.contents?.map((c) => {
-        let role = c.role;
-        // functionResponse must be role "user" for Claude models
+    // Fix contents for Gemini-compatible Cloud Code requests via Antigravity.
+    // Claude-branded Antigravity models use the same streamGenerateContent schema.
+    const normalizedContents: AntigravityContent[] =
+      rawContents.map((content): AntigravityContent => {
+        const c = content as AntigravityChunkContent;
+        let role = typeof c.role === "string" ? c.role : "user";
         if (c.parts?.some((p) => p.functionResponse)) {
           role = "user";
         }
 
         const hasFunctionCall = c.parts?.some((p) => p.functionCall) || false;
 
-        // Antigravity rejects synthetic thought text, but Gemini 3+ requires any
-        // returned thoughtSignature metadata to survive model tool-call turns.
         const parts =
           c.parts?.filter((p) => {
-            // Drop empty text parts
             if (typeof p.text === "string" && p.text === "") return false;
-            // Drop empty functionCalls
             if (p.functionCall && !p.functionCall.name) return false;
 
             return !p.thought && (hasFunctionCall || !p.thoughtSignature);
@@ -290,8 +515,7 @@ export class AntigravityExecutor extends BaseExecutor {
         return { ...c, role, parts };
       }) || [];
 
-    // Merge consecutive same-role entries and filter out empty sequences
-    const contents = [];
+    const contents: AntigravityContent[] = [];
     for (const c of normalizedContents) {
       if (!Array.isArray(c.parts) || c.parts.length === 0) continue;
       if (contents.length > 0 && contents[contents.length - 1].role === c.role) {
@@ -301,16 +525,23 @@ export class AntigravityExecutor extends BaseExecutor {
       }
     }
 
-    const transformedRequest = {
-      ...normalizedBody.request,
+    const rawTransformedRequest = {
+      ...normalizedRequest,
       ...(contents.length > 0 && { contents }),
-      sessionId: normalizedBody.request?.sessionId || this.generateSessionId(),
+      sessionId: getAntigravitySessionId(
+        credentials,
+        typeof normalizedRequest?.sessionId === "string" ? normalizedRequest.sessionId : undefined
+      ),
       safetySettings: undefined,
       toolConfig:
-        normalizedBody.request?.tools?.length > 0
+        Array.isArray(normalizedRequest?.tools) && normalizedRequest.tools.length > 0
           ? { functionCallingConfig: { mode: "VALIDATED" } }
-          : normalizedBody.request?.toolConfig,
+          : normalizedRequest?.toolConfig,
     };
+
+    const transformedRequest = isClaude
+      ? sanitizeAntigravityGeminiRequest(rawTransformedRequest)
+      : rawTransformedRequest;
 
     // Obfuscate sensitive client names in user content (e.g. "OpenCode", "Cursor")
     const requestContents = transformedRequest.contents;
@@ -326,18 +557,40 @@ export class AntigravityExecutor extends BaseExecutor {
       }
     }
 
-    return {
-      ...normalizedBody,
+    applyAntigravityGenerationDefaults(transformedRequest);
+
+    const {
+      project: _project,
+      model: _model,
+      userAgent: _userAgent,
+      requestType: _requestType,
+      requestId: _requestId,
+      request: _request,
+      ...passthroughFields
+    } = normalizedBody;
+
+    const requestType = _requestType === "image_gen" ? "image_gen" : "agent";
+    const envelope: AntigravityRequestEnvelope = {
       project: projectId,
-      model: upstreamModel,
-      userAgent: "antigravity",
-      requestType: "agent",
-      requestId: `agent-${crypto.randomUUID()}`,
+      requestId: generateAntigravityRequestId(),
       request: transformedRequest,
+      model: upstreamModel,
+      userAgent: getAntigravityEnvelopeUserAgent(credentials),
+      requestType,
+      ...passthroughFields,
     };
+
+    if (requestType === "agent" && envelope.enabledCreditTypes === undefined) {
+      envelope.enabledCreditTypes = ["GOOGLE_ONE_AI"];
+    }
+
+    return envelope;
   }
 
-  async refreshCredentials(credentials, log) {
+  async refreshCredentials(
+    credentials: AntigravityCredentials,
+    log?: ExecutorLog | null
+  ): Promise<AntigravityCredentials | null> {
     if (!credentials.refreshToken) return null;
 
     try {
@@ -346,37 +599,45 @@ export class AntigravityExecutor extends BaseExecutor {
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
           Accept: "application/json",
+          "User-Agent": antigravityNativeOAuthUserAgent(),
         },
         body: new URLSearchParams({
           grant_type: "refresh_token",
-          refresh_token: credentials.refreshToken,
-          client_id: this.config.clientId,
-          client_secret: this.config.clientSecret,
+          refresh_token: credentials.refreshToken || "",
+          client_id: this.config.clientId || "",
+          client_secret: this.config.clientSecret || "",
         }),
       });
 
       if (!response.ok) return null;
 
-      const tokens = await response.json();
+      const tokens = (await response.json()) as Record<string, unknown>;
       log?.info?.("TOKEN", "Antigravity refreshed");
 
       return {
-        accessToken: tokens.access_token,
-        refreshToken: tokens.refresh_token || credentials.refreshToken,
-        expiresIn: tokens.expires_in,
+        accessToken: typeof tokens.access_token === "string" ? tokens.access_token : undefined,
+        refreshToken:
+          typeof tokens.refresh_token === "string"
+            ? tokens.refresh_token
+            : credentials.refreshToken,
+        expiresIn: typeof tokens.expires_in === "number" ? tokens.expires_in : undefined,
         projectId: credentials.projectId,
+        // Preserve providerSpecificData so a projectId stored there survives the refresh
+        // (the onCredentialsRefreshed DB write) instead of being dropped → 422 (#2480).
+        providerSpecificData: credentials.providerSpecificData,
       };
     } catch (error) {
-      log?.error?.("TOKEN", `Antigravity refresh error: ${error.message}`);
+      const message = error instanceof Error ? error.message : String(error);
+      log?.error?.("TOKEN", `Antigravity refresh error: ${message}`);
       return null;
     }
   }
 
-  generateSessionId() {
+  generateSessionId(): string {
     return `-${parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % 9_000_000_000_000_000_000}`;
   }
 
-  parseRetryHeaders(headers) {
+  parseRetryHeaders(headers: Headers | null | undefined): number | null {
     if (!headers?.get) return null;
 
     const retryAfter = headers.get("retry-after");
@@ -409,7 +670,7 @@ export class AntigravityExecutor extends BaseExecutor {
 
   // Parse retry time from Antigravity error message body
   // Format: "Your quota will reset after 2h7m23s" or "1h30m" or "45m" or "30s"
-  parseRetryFromErrorMessage(errorMessage) {
+  parseRetryFromErrorMessage(errorMessage: unknown): number | null {
     if (!errorMessage || typeof errorMessage !== "string") return null;
 
     const match = errorMessage.match(/reset (?:after|in) (\d+h)?(\d+m)?(\d+s)?/i);
@@ -433,9 +694,22 @@ export class AntigravityExecutor extends BaseExecutor {
    * Parses Gemini-format SSE chunks and assembles text content + usage into one
    * OpenAI-format chat.completion payload.
    */
-  collectStreamToResponse(response, model, url, headers, transformedBody, log?, signal?) {
+  collectStreamToResponse(
+    response: Response,
+    model: string,
+    url: string,
+    headers: Record<string, string>,
+    transformedBody: Record<string, unknown>,
+    log?: ExecutorLog | null,
+    signal?: AbortSignal | null
+  ) {
+    if (!response.body) {
+      return Promise.resolve({ response, url, headers, transformedBody });
+    }
+
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+    const logger = log || undefined;
 
     const SSE_COLLECT_TIMEOUT_MS = 120_000;
 
@@ -467,7 +741,7 @@ export class AntigravityExecutor extends BaseExecutor {
             decoder.decode(value, { stream: true }),
             partialLine,
             collected,
-            log
+            logger
           );
         }
       } catch (err) {
@@ -476,8 +750,8 @@ export class AntigravityExecutor extends BaseExecutor {
         log?.warn?.("SSE_COLLECT", `Error collecting SSE stream: ${msg}`);
         // Fall through — return whatever was collected so far
       }
-      processAntigravitySSEText(decoder.decode(), partialLine, collected, log);
-      flushAntigravitySSEText(partialLine, collected, log);
+      processAntigravitySSEText(decoder.decode(), partialLine, collected, logger);
+      flushAntigravitySSEText(partialLine, collected, logger);
 
       const result = {
         id: `chatcmpl-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
@@ -523,7 +797,7 @@ export class AntigravityExecutor extends BaseExecutor {
     let lastError = null;
     let lastStatus = 0;
     const MAX_AUTO_RETRIES = 3;
-    const retryAttemptsByUrl = {}; // Track retry attempts per URL
+    const retryAttemptsByUrl: Record<number, number> = {}; // Track retry attempts per URL
 
     // Always stream upstream — buildUrl always returns the streaming endpoint.
     // For non-streaming clients, we collect the SSE below and return a synthetic
@@ -542,19 +816,59 @@ export class AntigravityExecutor extends BaseExecutor {
     const creditsMode = getCreditsMode();
     const useCreditsFirst = shouldUseCreditsFirst(credentials?.accessToken || "", creditsMode);
 
+    const fetchWithReadinessTimeout = async (
+      url: string,
+      init: RequestInit,
+      timeoutMs = STREAM_READINESS_TIMEOUT_MS
+    ): Promise<Response> => {
+      const boundedTimeoutMs = Math.max(0, Math.floor(timeoutMs));
+      if (boundedTimeoutMs <= 0) {
+        return fetch(url, init);
+      }
+
+      const timeoutController = new AbortController();
+      let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+        timeoutController.abort(new AntigravityPreResponseTimeoutError(boundedTimeoutMs, url));
+      }, boundedTimeoutMs);
+
+      const existingSignal = init.signal instanceof AbortSignal ? init.signal : null;
+      const combinedSignal = existingSignal
+        ? mergeAbortSignals(existingSignal, timeoutController.signal)
+        : timeoutController.signal;
+
+      try {
+        return await fetch(url, { ...init, signal: combinedSignal });
+      } catch (error) {
+        if (
+          timeoutController.signal.aborted &&
+          isAntigravityPreResponseTimeout(timeoutController.signal.reason)
+        ) {
+          throw timeoutController.signal.reason;
+        }
+        throw error;
+      } finally {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+      }
+    };
+
     for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
       const url = this.buildUrl(model, upstreamStream, urlIndex);
       const headers = this.buildHeaders(credentials, upstreamStream);
       mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
-      let transformedBody = await this.transformRequest(model, body, upstreamStream, credentials);
+      const transformed = await this.transformRequest(model, body, upstreamStream, credentials);
       let requestToolNameMap: Map<string, string> | null = null;
 
-      if (transformedBody instanceof Response) {
-        return { response: transformedBody, url, headers, transformedBody: body };
+      if (transformed instanceof Response) {
+        return { response: transformed, url, headers, transformedBody: body };
       }
 
+      let transformedBody: Record<string, unknown> = transformed;
+
       if (transformedBody && typeof transformedBody === "object") {
-        const cloaked = cloakAntigravityToolPayload(transformedBody as Record<string, unknown>);
+        const cloaked = cloakAntigravityToolPayload(transformedBody);
         transformedBody = cloaked.body;
         requestToolNameMap = cloaked.toolNameMap;
       }
@@ -573,15 +887,79 @@ export class AntigravityExecutor extends BaseExecutor {
       }
 
       try {
-        const response = await fetch(url, {
-          method: "POST",
+        const serializedRequest = serializeAntigravityRequest(
+          this.provider,
           headers,
-          body: JSON.stringify(transformedBody),
+          transformedBody
+        );
+        let finalHeaders = serializedRequest.headers;
+        const clientProfile = applyAntigravityClientProfileHeaders(
+          finalHeaders,
+          credentials,
+          transformedBody
+        );
+
+        log?.debug?.(
+          "TELEMETRY",
+          `[Antigravity] Execute - URL: ${url}, Model: ${model}, Target: ${getRequestTargetModel(transformedBody)}, RetryAttempt: ${retryAttemptsByUrl[urlIndex]}`
+        );
+
+        // Dump outgoing headers (mask Authorization) and envelope shape for debugging
+        if (log?.debug) {
+          const safeHeaders = { ...finalHeaders };
+          if (safeHeaders["Authorization"]) safeHeaders["Authorization"] = "Bearer ***";
+          log.debug("AG_REQUEST_HEADERS", JSON.stringify(safeHeaders));
+
+          const envelope = transformedBody as Record<string, unknown>;
+          const requestInner = envelope.request as Record<string, unknown> | undefined;
+          log.debug(
+            "AG_REQUEST_ENVELOPE",
+            JSON.stringify({
+              fieldOrder: Object.keys(envelope),
+              project: envelope.project,
+              requestId: envelope.requestId,
+              model: envelope.model,
+              userAgent: envelope.userAgent,
+              requestType: envelope.requestType,
+              enabledCreditTypes: envelope.enabledCreditTypes,
+              clientProfile,
+              sessionId: requestInner?.sessionId,
+              generationConfig: requestInner?.generationConfig,
+            })
+          );
+        }
+
+        let response = await fetchWithReadinessTimeout(url, {
+          method: "POST",
+          headers: finalHeaders,
+          body: getChunkedOrFixedBody(serializedRequest.bodyString, stream),
+          ...(stream ? { duplex: "half" } : {}),
           signal,
         });
 
+        if (response.status === HTTP_STATUS.FORBIDDEN && finalHeaders["x-goog-user-project"]) {
+          const retryHeaders = { ...finalHeaders };
+          removeHeaderCaseInsensitive(retryHeaders, "x-goog-user-project");
+          log?.debug?.("RETRY", "403 with x-goog-user-project, retrying once without it");
+          response = await fetchWithReadinessTimeout(url, {
+            method: "POST",
+            headers: retryHeaders,
+            body: getChunkedOrFixedBody(serializedRequest.bodyString, stream),
+            ...(stream ? { duplex: "half" } : {}),
+            signal,
+          });
+          finalHeaders = retryHeaders;
+        }
+
+        if (!response.ok) {
+          log?.warn?.(
+            "TELEMETRY",
+            `[Antigravity] Error Response - URL: ${url}, Status: ${response.status}, Model: ${model}`
+          );
+        }
+
         // Parse retry time for 429/503 responses
-        let retryMs = null;
+        let retryMs: number | null = null;
 
         if (
           response.status === HTTP_STATUS.RATE_LIMITED ||
@@ -626,11 +1004,18 @@ export class AntigravityExecutor extends BaseExecutor {
               ) {
                 log?.info?.("AG_CREDITS", "Retrying with Google One AI credits");
                 const creditsBody = injectCreditsField(transformedBody);
+                const serializedCreditsRequest = serializeAntigravityRequest(
+                  this.provider,
+                  headers,
+                  creditsBody
+                );
+                const finalCreditsHeaders = serializedCreditsRequest.headers;
                 try {
-                  const creditsResp = await fetch(url, {
+                  const creditsResp = await fetchWithReadinessTimeout(url, {
                     method: "POST",
-                    headers,
-                    body: JSON.stringify(creditsBody),
+                    headers: finalCreditsHeaders,
+                    body: getChunkedOrFixedBody(serializedCreditsRequest.bodyString, stream),
+                    ...(stream ? { duplex: "half" } : {}),
                     signal,
                   });
                   if (creditsResp.ok || creditsResp.status !== HTTP_STATUS.RATE_LIMITED) {
@@ -640,7 +1025,7 @@ export class AntigravityExecutor extends BaseExecutor {
                         creditsResp,
                         model,
                         url,
-                        headers,
+                        finalCreditsHeaders,
                         creditsBody,
                         log,
                         signal
@@ -668,7 +1053,7 @@ export class AntigravityExecutor extends BaseExecutor {
                     return {
                       response: creditsResp,
                       url,
-                      headers,
+                      headers: finalCreditsHeaders,
                       transformedBody: attachToolNameMap(creditsBody, requestToolNameMap),
                     };
                   }
@@ -769,7 +1154,7 @@ export class AntigravityExecutor extends BaseExecutor {
             return {
               response: modifiedResponse,
               url,
-              headers,
+              headers: finalHeaders,
               transformedBody: attachToolNameMap(transformedBody, requestToolNameMap),
             };
           } catch (err) {
@@ -785,7 +1170,7 @@ export class AntigravityExecutor extends BaseExecutor {
             response,
             model,
             url,
-            headers,
+            finalHeaders,
             transformedBody,
             log,
             signal
@@ -869,11 +1254,12 @@ export class AntigravityExecutor extends BaseExecutor {
                   try {
                     const parsed = JSON.parse(payload);
                     if (Array.isArray(parsed?.remainingCredits)) {
-                      const googleCredit = parsed.remainingCredits.find(
-                        (c) => c?.creditType === "GOOGLE_ONE_AI"
-                      );
+                      const googleCredit = parsed.remainingCredits.find((c: unknown) => {
+                        const credit = asRecord(c);
+                        return credit?.creditType === "GOOGLE_ONE_AI";
+                      }) as AntigravityCreditEntry | undefined;
                       if (googleCredit) {
-                        const balance = parseInt(googleCredit.creditAmount, 10);
+                        const balance = parseInt(String(googleCredit.creditAmount ?? ""), 10);
                         if (!isNaN(balance)) {
                           updateAntigravityRemainingCredits(accountId, balance);
                         }
@@ -898,7 +1284,7 @@ export class AntigravityExecutor extends BaseExecutor {
           return {
             response: tappedResponse,
             url,
-            headers,
+            headers: finalHeaders,
             transformedBody: attachToolNameMap(transformedBody, requestToolNameMap),
           };
         }
@@ -906,11 +1292,15 @@ export class AntigravityExecutor extends BaseExecutor {
         return {
           response,
           url,
-          headers,
+          headers: finalHeaders,
           transformedBody: attachToolNameMap(transformedBody, requestToolNameMap),
         };
       } catch (error) {
         lastError = error;
+        log?.error?.(
+          "TELEMETRY",
+          `[Antigravity] Network/Fetch Error - URL: ${url}, Model: ${model}, Error: ${error instanceof Error ? error.message : String(error)}`
+        );
         if (urlIndex + 1 < fallbackCount) {
           log?.debug?.("RETRY", `Error on ${url}, trying fallback ${urlIndex + 1}`);
           continue;

@@ -17,6 +17,32 @@ import {
   getAllAccessTokens as _getAllAccessTokens,
 } from "@omniroute/open-sse/services/tokenRefresh.ts";
 
+// Per-connection mutex: prevents concurrent OAuth refresh for rotating tokens.
+// Key = connectionId, Value = { promise: in-flight refresh, waiters: count of callers sharing it }
+const connectionRefreshMutex = new Map<string, { promise: Promise<any>; waiters: number }>();
+
+export async function withConnectionRefreshMutex<T>(
+  connectionId: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const existing = connectionRefreshMutex.get(connectionId);
+  if (existing) {
+    existing.waiters++;
+    log.info("TOKEN_REFRESH", "Concurrent refresh detected — sharing in-flight refresh", {
+      connectionId,
+      waiters: existing.waiters,
+    });
+    return existing.promise as Promise<T>;
+  }
+
+  const entry: { promise: Promise<T>; waiters: number } = { promise: null as any, waiters: 0 };
+  entry.promise = fn().finally(() => {
+    connectionRefreshMutex.delete(connectionId);
+  });
+  connectionRefreshMutex.set(connectionId, entry);
+  return entry.promise;
+}
+
 export const TOKEN_EXPIRY_BUFFER_MS = BUFFER_MS;
 
 export const refreshAccessToken = async (
@@ -115,6 +141,9 @@ export async function updateProviderCredentials(connectionId: string, newCredent
     if (newCredentials.testStatus) {
       updates.testStatus = newCredentials.testStatus;
     }
+    if (newCredentials.isActive !== undefined) {
+      updates.isActive = newCredentials.isActive;
+    }
 
     const result = await updateProviderConnection(connectionId, updates);
     log.info("TOKEN_REFRESH", "Credentials updated in localDb", {
@@ -146,9 +175,24 @@ export async function checkAndRefreshToken(provider: string, credentials: any) {
         expiresIn: Math.round((expiresAt - now) / 1000),
       });
 
-      const newCredentials = await getAccessToken(provider, updatedCredentials);
+      const connectionId: string | undefined = updatedCredentials.connectionId;
+      const newCredentials = connectionId
+        ? await withConnectionRefreshMutex(connectionId, async () => {
+            const result = await getAccessToken(provider, updatedCredentials);
+            if (result?.accessToken) {
+              // Persist BEFORE the mutex releases so a concurrent request
+              // cannot read stale DB credentials and re-use a rotated refresh token.
+              await updateProviderCredentials(connectionId, result);
+            }
+            return result;
+          })
+        : await getAccessToken(provider, updatedCredentials);
       if (newCredentials && newCredentials.accessToken) {
-        await updateProviderCredentials(updatedCredentials.connectionId, newCredentials);
+        // DB already updated inside the mutex when connectionId is present.
+        // For the no-connectionId path, persist here as before.
+        if (!connectionId) {
+          await updateProviderCredentials(updatedCredentials.connectionId, newCredentials);
+        }
 
         updatedCredentials = {
           ...updatedCredentials,

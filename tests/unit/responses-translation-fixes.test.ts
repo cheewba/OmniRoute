@@ -406,7 +406,30 @@ test("Responses→Chat streaming: reasoning delta emits reasoning_content in Cha
   };
   const result = openaiResponsesToOpenAIResponse(chunk, state);
   assert.ok(result, "should return a chunk");
-  assert.equal(result.choices[0].delta.reasoning.summary, "thinking step...");
+  assert.equal(result.choices[0].delta.reasoning_content, "thinking step...");
+});
+
+test("Responses→Chat streaming: Copilot mode emits reasoning_text for summary deltas", () => {
+  const state = {
+    started: false,
+    chatId: null,
+    created: null,
+    toolCallIndex: 0,
+    finishReasonSent: false,
+    copilotCompatibleReasoning: true,
+  };
+
+  const chunk = {
+    type: "response.reasoning_summary_text.delta",
+    delta: "thinking step...",
+    item_id: "rs_1",
+    output_index: 0,
+    summary_index: 0,
+  };
+  const result = openaiResponsesToOpenAIResponse(chunk, state);
+  assert.ok(result, "should return a chunk");
+  assert.equal(result.choices[0].delta.reasoning_text, "thinking step...");
+  assert.equal(result.choices[0].delta.reasoning, undefined);
 });
 
 test("Chat→Responses streaming: multiple <think> tags in one chunk handled", () => {

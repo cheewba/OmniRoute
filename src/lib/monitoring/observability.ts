@@ -56,6 +56,7 @@ interface BuildSessionsSummaryOptions {
 interface BuildTelemetryPayloadOptions {
   summary: {
     count: number;
+    avg?: number;
     p50: number;
     p95: number;
     p99: number;
@@ -80,6 +81,13 @@ interface BuildHealthPayloadOptions {
   quotaMonitorMonitors: QuotaMonitorSnapshot[];
   activeSessions: SessionSnapshot[];
   activeSessionsByKey?: Record<string, number>;
+  credentialHealth?: {
+    total: number;
+    healthy: number;
+    failed: number;
+    unknown: number;
+    stale: number;
+  };
 }
 
 function limitMonitors(monitors: QuotaMonitorSnapshot[], maxItems = 8): QuotaMonitorSnapshot[] {
@@ -118,6 +126,7 @@ export function buildTelemetryPayload({
   return {
     ...summary,
     totalRequests: summary.count,
+    avgLatencyMs: summary.avg ?? summary.p50,
     sessions: {
       activeCount: sessions.activeCount,
       stickyBoundCount: sessions.stickyBoundCount,
@@ -147,6 +156,7 @@ export function buildHealthPayload({
   quotaMonitorMonitors,
   activeSessions,
   activeSessionsByKey = {},
+  credentialHealth,
 }: BuildHealthPayloadOptions) {
   const timestamp = new Date().toISOString();
   const system = {
@@ -200,10 +210,11 @@ export function buildHealthPayload({
       if (cb.name.startsWith("test-") || cb.name.startsWith("test_")) return acc;
       if (cb.state === "OPEN") acc.open += 1;
       else if (cb.state === "HALF_OPEN") acc.halfOpen += 1;
+      else if (cb.state === "DEGRADED") acc.degraded += 1;
       else acc.closed += 1;
       return acc;
     },
-    { open: 0, halfOpen: 0, closed: 0 }
+    { open: 0, halfOpen: 0, degraded: 0, closed: 0 }
   );
 
   return {
@@ -216,7 +227,8 @@ export function buildHealthPayload({
     activeConnections: connections.length,
     circuitBreakers: {
       ...breakerCounts,
-      total: breakerCounts.open + breakerCounts.halfOpen + breakerCounts.closed,
+      total:
+        breakerCounts.open + breakerCounts.halfOpen + breakerCounts.degraded + breakerCounts.closed,
     },
     providerBreakers,
     providerHealth,
@@ -235,6 +247,7 @@ export function buildHealthPayload({
       monitors: limitMonitors(quotaMonitorMonitors),
     },
     sessions: buildSessionsSummary({ activeSessions, activeSessionsByKey }),
+    credentialHealth, // may be undefined if credentialHealth module not loaded
     dedup: {
       inflightRequests,
     },

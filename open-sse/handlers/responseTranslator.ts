@@ -1,4 +1,8 @@
 import { FORMATS } from "../translator/formats.ts";
+import {
+  buildGeminiThoughtSignatureKey,
+  storeGeminiThoughtSignature,
+} from "../services/geminiThoughtSignatureStore.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -18,6 +22,16 @@ function toNumber(value: unknown, fallback = 0): number {
         ? Number(value)
         : Number.NaN;
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function firstPositiveNumber(...values: unknown[]): number {
+  for (const value of values) {
+    const parsed = toNumber(value, 0);
+    if (parsed > 0) {
+      return parsed;
+    }
+  }
+  return 0;
 }
 
 function extractMessageOutputText(item: JsonRecord): string {
@@ -123,10 +137,17 @@ export function translateNonStreamingResponse(
           toString(itemObj.call_id) ||
           toString(itemObj.id) ||
           `call_${Date.now()}_${toolCalls.length}`;
+        let argsToEmit = itemObj.arguments;
+        if (argsToEmit != null && typeof argsToEmit === "object" && !Array.isArray(argsToEmit)) {
+          const cleaned: JsonRecord = { ...(argsToEmit as JsonRecord) };
+          for (const [k, v] of Object.entries(cleaned)) {
+            if (v === "" || (Array.isArray(v) && v.length === 0)) delete cleaned[k];
+          }
+          argsToEmit = cleaned;
+        }
+
         const fnArgs =
-          typeof itemObj.arguments === "string"
-            ? itemObj.arguments
-            : JSON.stringify(itemObj.arguments || {});
+          typeof argsToEmit === "string" ? argsToEmit : JSON.stringify(argsToEmit || {});
         const rawName = toString(itemObj.name);
         // Strip Claude OAuth proxy_ prefix using toolNameMap
         const resolvedName = toolNameMap?.get(rawName) ?? rawName;
@@ -188,28 +209,45 @@ export function translateNonStreamingResponse(
     if (Object.keys(usage).length > 0) {
       const inputTokens = toNumber(usage.input_tokens, 0);
       const outputTokens = toNumber(usage.output_tokens, 0);
+      const inputTokensDetails = toRecord(usage.input_tokens_details);
+      const outputTokensDetails = toRecord(usage.output_tokens_details);
+      const promptTokensDetails = toRecord(usage.prompt_tokens_details);
+      const completionTokensDetails = toRecord(usage.completion_tokens_details);
+      const cachedInputTokens = firstPositiveNumber(
+        inputTokensDetails.cached_tokens,
+        promptTokensDetails.cached_tokens,
+        usage.cache_read_input_tokens
+      );
+      const cacheCreationInputTokens = firstPositiveNumber(
+        inputTokensDetails.cache_creation_tokens,
+        promptTokensDetails.cache_creation_tokens,
+        usage.cache_creation_input_tokens
+      );
+      const reasoningTokens = firstPositiveNumber(
+        outputTokensDetails.reasoning_tokens,
+        completionTokensDetails.reasoning_tokens,
+        usage.reasoning_tokens
+      );
+
       result.usage = {
         prompt_tokens: inputTokens,
         completion_tokens: outputTokens,
         total_tokens: inputTokens + outputTokens,
       };
 
-      if (toNumber(usage.reasoning_tokens, 0) > 0) {
+      if (reasoningTokens > 0) {
         (result.usage as JsonRecord).completion_tokens_details = {
-          reasoning_tokens: toNumber(usage.reasoning_tokens, 0),
+          reasoning_tokens: reasoningTokens,
         };
       }
-      if (
-        toNumber(usage.cache_read_input_tokens, 0) > 0 ||
-        toNumber(usage.cache_creation_input_tokens, 0) > 0
-      ) {
+      if (cachedInputTokens > 0 || cacheCreationInputTokens > 0) {
         (result.usage as JsonRecord).prompt_tokens_details = {};
         const promptDetails = (result.usage as JsonRecord).prompt_tokens_details as JsonRecord;
-        if (toNumber(usage.cache_read_input_tokens, 0) > 0) {
-          promptDetails.cached_tokens = toNumber(usage.cache_read_input_tokens, 0);
+        if (cachedInputTokens > 0) {
+          promptDetails.cached_tokens = cachedInputTokens;
         }
-        if (toNumber(usage.cache_creation_input_tokens, 0) > 0) {
-          promptDetails.cache_creation_tokens = toNumber(usage.cache_creation_input_tokens, 0);
+        if (cacheCreationInputTokens > 0) {
+          promptDetails.cache_creation_tokens = cacheCreationInputTokens;
         }
       }
     }
@@ -244,6 +282,7 @@ export function translateNonStreamingResponse(
               const contentParts: JsonRecord[] = [];
               const toolCalls: JsonRecord[] = [];
               let reasoningContent = "";
+              let pendingThoughtSignature = "";
 
               if (Array.isArray(content.parts)) {
                 for (const part of content.parts) {
@@ -251,6 +290,15 @@ export function translateNonStreamingResponse(
                   if (partObj.thought === true && typeof partObj.text === "string") {
                     reasoningContent += partObj.text;
                     continue;
+                  }
+
+                  // Capture thoughtSignature from thinking parts (Gemini thinking models)
+                  // so it can be stored alongside any subsequent functionCall part.
+                  const partThoughtSig = toString(
+                    partObj.thoughtSignature ?? partObj.thought_signature
+                  );
+                  if (partThoughtSig) {
+                    pendingThoughtSignature = partThoughtSig;
                   }
 
                   if (typeof partObj.text === "string") {
@@ -274,8 +322,24 @@ export function translateNonStreamingResponse(
                     const fn = toRecord(partObj.functionCall);
                     const rawName = toString(fn.name);
                     const restoredName = toolNameMap?.get(rawName) ?? rawName;
+                    const nativeId = toString(fn.id);
+                    const toolCallId =
+                      nativeId.length > 0
+                        ? nativeId
+                        : `call_${toString(restoredName, "unknown")}_${Date.now()}_${toolCalls.length}`;
+
+                    // Persist the thought signature so openai-to-gemini can
+                    // resolve it on the next turn. Use the part-level field
+                    // (part.thoughtSignature) and fall back to any signature
+                    // captured from an earlier thinking-only part.
+                    const sig = partThoughtSig || pendingThoughtSignature;
+                    if (sig) {
+                      const sigKey = buildGeminiThoughtSignatureKey(null, toolCallId);
+                      storeGeminiThoughtSignature(sigKey, sig);
+                    }
+
                     toolCalls.push({
-                      id: `call_${toString(restoredName, "unknown")}_${Date.now()}_${toolCalls.length}`,
+                      id: toolCallId,
                       type: "function",
                       function: {
                         name: restoredName,

@@ -30,12 +30,17 @@ function normalizeGeminiToolName(
   options: GeminiToolSanitizationOptions = {}
 ): string {
   const trimmed = name.trim();
-  if (!options.stripNamespace) {
-    return trimmed;
-  }
+  const namespaceStripped = !options.stripNamespace
+    ? trimmed
+    : (() => {
+        const namespaceIndex = trimmed.indexOf(":");
+        return namespaceIndex >= 0 ? trimmed.slice(namespaceIndex + 1) : trimmed;
+      })();
 
-  const namespaceIndex = trimmed.indexOf(":");
-  return namespaceIndex >= 0 ? trimmed.slice(namespaceIndex + 1) : trimmed;
+  return namespaceStripped
+    .replace(/[^a-zA-Z0-9_]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
 }
 
 function buildHashedGeminiToolName(
@@ -204,19 +209,15 @@ export function buildGeminiTools(
     }
   }
 
-  if (googleSearchTool && functionDeclarations.length > 0) {
-    console.warn(
-      `[GeminiTools] Removing ${functionDeclarations.length} functionDeclarations because googleSearch cannot be mixed with Gemini function tools`
-    );
-  }
+  const result: GeminiTool[] = [];
 
   if (googleSearchTool) {
     return [googleSearchTool];
   }
 
   if (functionDeclarations.length > 0) {
-    return [{ functionDeclarations }];
+    result.push({ functionDeclarations });
   }
 
-  return undefined;
+  return result.length > 0 ? result : undefined;
 }

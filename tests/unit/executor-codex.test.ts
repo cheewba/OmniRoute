@@ -19,12 +19,27 @@ import {
 } from "../../open-sse/services/thinkingBudget.ts";
 import { CODEX_CHAT_DEFAULT_INSTRUCTIONS } from "../../open-sse/config/codexInstructions.ts";
 
+type MockCodexWebSocket = {
+  send: (data: string) => void;
+  close: (code?: number, reason?: string) => void;
+  onmessage: ((event: { data: unknown }) => void) | null;
+  onerror: ((event: { message?: string }) => void) | null;
+  onclose: (() => void) | null;
+};
+
+function getRecord(value: unknown): Record<string, unknown> {
+  assert.equal(typeof value, "object");
+  assert.notEqual(value, null);
+  assert.equal(Array.isArray(value), false);
+  return value as Record<string, unknown>;
+}
+
 test.afterEach(() => {
   setThinkingBudgetConfig(DEFAULT_THINKING_CONFIG);
   __setCodexWebSocketTransportForTesting(undefined);
 });
 
-async function withEnv(entries, fn) {
+async function withEnv<T>(entries: Record<string, string | undefined>, fn: () => T | Promise<T>) {
   const previous = new Map();
 
   for (const [key, value] of Object.entries(entries)) {
@@ -68,7 +83,13 @@ test("Codex helper functions isolate rate-limit scopes and parse quota headers",
   assert.equal(getCodexUpstreamModel("gpt-5.5-medium"), "gpt-5.5");
   // With mock WS transport + codexTransport=websocket, gpt-5.5 models require WS
   __setCodexWebSocketTransportForTesting(
-    async () => ({ send() {}, close() {}, onmessage: null, onerror: null, onclose: null }) as any
+    async (): Promise<MockCodexWebSocket> => ({
+      send() {},
+      close() {},
+      onmessage: null,
+      onerror: null,
+      onclose: null,
+    })
   );
   assert.equal(
     isCodexResponsesWebSocketRequired("gpt-5.5-xhigh", {
@@ -78,12 +99,6 @@ test("Codex helper functions isolate rate-limit scopes and parse quota headers",
   );
   assert.equal(
     isCodexResponsesWebSocketRequired("gpt-5.5-medium", {
-      providerSpecificData: { codexTransport: "websocket" },
-    }),
-    true
-  );
-  assert.equal(
-    isCodexResponsesWebSocketRequired("gpt-5.5-mini", {
       providerSpecificData: { codexTransport: "websocket" },
     }),
     true
@@ -135,10 +150,10 @@ test("CodexExecutor.buildHeaders binds workspace ids and disables SSE accept for
   assert.equal(standardHeaders.Authorization, "Bearer codex-token");
   assert.equal(standardHeaders.Accept, "text/event-stream");
   assert.equal(standardHeaders["chatgpt-account-id"], "workspace-1");
-  assert.equal(standardHeaders.Version, "0.125.0");
+  assert.equal(standardHeaders.Version, "0.132.0");
   assert.equal(standardHeaders["Openai-Beta"], "responses=experimental");
   assert.equal(standardHeaders["X-Codex-Beta-Features"], "responses_websockets");
-  assert.equal(standardHeaders["User-Agent"], "codex-cli/0.125.0 (Windows 10.0.26100; x64)");
+  assert.equal(standardHeaders["User-Agent"], "codex-cli/0.132.0 (Windows 10.0.26200; x64)");
   assert.equal(compactHeaders.Accept, "application/json");
 });
 
@@ -147,13 +162,13 @@ test("CodexExecutor.buildHeaders honors safe env overrides for Version and User-
 
   await withEnv(
     {
-      CODEX_CLIENT_VERSION: "0.120.0-alpha.3",
+      CODEX_CLIENT_VERSION: "0.132.0",
       CODEX_USER_AGENT: undefined,
     },
     () => {
       const headers = executor.buildHeaders({ accessToken: "codex-token" }, true);
-      assert.equal(headers.Version, "0.120.0-alpha.3");
-      assert.equal(headers["User-Agent"], "codex-cli/0.120.0-alpha.3 (Windows 10.0.26100; x64)");
+      assert.equal(headers.Version, "0.132.0");
+      assert.equal(headers["User-Agent"], "codex-cli/0.132.0 (Windows 10.0.26200; x64)");
     }
   );
 
@@ -164,7 +179,7 @@ test("CodexExecutor.buildHeaders honors safe env overrides for Version and User-
     },
     () => {
       const headers = executor.buildHeaders({ accessToken: "codex-token" }, true);
-      assert.equal(headers.Version, "0.125.0");
+      assert.equal(headers.Version, "0.132.0");
       assert.equal(headers["User-Agent"], "custom-codex/9.9.9");
     }
   );
@@ -199,6 +214,95 @@ test("CodexExecutor.transformRequest injects default instructions, clamps reason
   assert.equal(result.temperature, undefined);
   assert.equal(result.user, undefined);
   assert.equal(result.stream_options, undefined);
+});
+
+// Issue #2608: gpt-5.5 models reject residual Chat Completions fields via Codex OAuth.
+// The non-passthrough path must strip ALL non-Responses-API fields using an allowlist.
+test("CodexExecutor.transformRequest non-passthrough allowlist strips all residual Chat Completions fields (#2608)", () => {
+  const executor = new CodexExecutor();
+  const body = {
+    model: "gpt-5.5",
+    messages: [{ role: "user", content: "hello" }],
+    instructions: "",
+    // All of these are Chat Completions fields that must be stripped:
+    temperature: 0.7,
+    top_p: 0.9,
+    frequency_penalty: 0.5,
+    presence_penalty: 0.3,
+    logprobs: true,
+    top_logprobs: 3,
+    n: 2,
+    seed: 42,
+    stop: ["\n"],
+    response_format: { type: "json_object" },
+    logit_bias: { "123": 1 },
+    function_call: "auto",
+    functions: [{ name: "test", parameters: {} }],
+    max_completion_tokens: 1000,
+    parallel_tool_calls: true,
+    user: "cursor-user",
+    metadata: { key: "value" },
+    stream_options: { include_usage: true },
+    safety_identifier: "safe-1",
+    suffix: "end",
+    // Custom/arbitrary fields that could be injected by middleware
+    custom_field: "should be stripped",
+    _internal_marker: true,
+  };
+
+  const result = executor.transformRequest("gpt-5.5", body, false, {
+    requestEndpointPath: "/responses",
+  });
+
+  // Allowed Responses API fields should survive
+  assert.equal(result.model, "gpt-5.5");
+  assert.ok(Array.isArray(result.input));
+  assert.equal(typeof result.instructions, "string");
+  assert.equal(result.store, false);
+  assert.equal(result.stream, true);
+
+  // All Chat Completions fields must be stripped
+  assert.equal(result.temperature, undefined, "temperature should be stripped");
+  assert.equal(result.top_p, undefined, "top_p should be stripped");
+  assert.equal(result.frequency_penalty, undefined, "frequency_penalty should be stripped");
+  assert.equal(result.presence_penalty, undefined, "presence_penalty should be stripped");
+  assert.equal(result.logprobs, undefined, "logprobs should be stripped");
+  assert.equal(result.top_logprobs, undefined, "top_logprobs should be stripped");
+  assert.equal(result.n, undefined, "n should be stripped");
+  assert.equal(result.seed, undefined, "seed should be stripped");
+  assert.equal(result.stop, undefined, "stop should be stripped");
+  assert.equal(result.response_format, undefined, "response_format should be stripped");
+  assert.equal(result.logit_bias, undefined, "logit_bias should be stripped");
+  assert.equal(result.function_call, undefined, "function_call should be stripped");
+  assert.equal(result.functions, undefined, "functions should be stripped");
+  assert.equal(result.max_completion_tokens, undefined, "max_completion_tokens should be stripped");
+  assert.equal(result.parallel_tool_calls, undefined, "parallel_tool_calls should be stripped");
+  assert.equal(result.user, undefined, "user should be stripped");
+  assert.equal(result.metadata, undefined, "metadata should be stripped");
+  assert.equal(result.stream_options, undefined, "stream_options should be stripped");
+  assert.equal(result.safety_identifier, undefined, "safety_identifier should be stripped");
+  assert.equal(result.suffix, undefined, "suffix should be stripped");
+  assert.equal(result.custom_field, undefined, "arbitrary custom fields should be stripped");
+  assert.equal(result._internal_marker, undefined, "internal markers should be stripped");
+});
+
+test("CodexExecutor.transformRequest normalizes max reasoning_effort to xhigh", () => {
+  const executor = new CodexExecutor();
+  const result = executor.transformRequest(
+    "gpt-5.5",
+    {
+      model: "gpt-5.5",
+      input: [],
+      reasoning_effort: "max",
+    },
+    false,
+    {
+      requestEndpointPath: "/responses",
+    }
+  );
+
+  assert.equal(result.reasoning.effort, "xhigh");
+  assert.equal(result.reasoning_effort, undefined);
 });
 
 test("CodexExecutor.transformRequest sends neutral instructions for bare chat requests", () => {
@@ -250,17 +354,39 @@ test("CodexExecutor.transformRequest preserves compact requests and native passt
   assert.equal(result.stream, undefined);
   assert.equal(result.service_tier, "priority");
   assert.equal(result.reasoning.effort, "medium");
-  assert.equal(result.store, false);
+  assert.equal(result.store, undefined);
   assert.equal(result.instructions, "keep this");
 });
 
-test("CodexExecutor.transformRequest preserves store-enabled responses state when explicitly enabled", () => {
+test("CodexExecutor.transformRequest preserves previous_response_id without local handling", () => {
   const executor = new CodexExecutor();
   const body = {
     _nativeCodexPassthrough: true,
     _omnirouteResponsesStore: true,
     instructions: "keep this",
     previous_response_id: "resp_prev_123",
+    stream: false,
+  };
+
+  const result = executor.transformRequest("gpt-5.3-codex", body, false, {
+    requestEndpointPath: "/responses",
+    providerSpecificData: {
+      openaiStoreEnabled: true,
+      requestDefaults: { serviceTier: "priority" },
+    },
+  });
+
+  assert.equal(result._omnirouteResponsesStore, undefined);
+  assert.equal(result.store, true);
+  assert.equal(result.previous_response_id, "resp_prev_123");
+});
+test("CodexExecutor.transformRequest strips store from compact requests even when store is enabled", () => {
+  const executor = new CodexExecutor();
+  const body = {
+    _nativeCodexPassthrough: true,
+    _omnirouteResponsesStore: true,
+    instructions: "keep this",
+    store: true,
     stream: false,
   };
 
@@ -273,10 +399,165 @@ test("CodexExecutor.transformRequest preserves store-enabled responses state whe
   });
 
   assert.equal(result._omnirouteResponsesStore, undefined);
-  assert.equal(result.store, true);
-  assert.equal(result.previous_response_id, undefined);
+  assert.equal(result.store, undefined);
+  assert.equal(result.stream, undefined);
+  assert.equal(result.instructions, "keep this");
 });
 
+test("CodexExecutor.transformRequest strips raw internal assistant commentary without dropping useful Responses items", () => {
+  const executor = new CodexExecutor();
+  const body = {
+    _nativeCodexPassthrough: true,
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Use the tool result." }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        phase: "commentary",
+        content: [{ type: "output_text", text: "Need maybe inspect tool output first." }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        phase: "final",
+        content: [{ type: "output_text", text: "Visible final assistant answer." }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        phase: "final_answer",
+        content: [{ type: "output_text", text: "Visible final_answer assistant answer." }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Visible assistant history without phase." }],
+      },
+      {
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: "formal reasoning item" }],
+      },
+      {
+        type: "function_call",
+        call_id: "call_keep_123",
+        name: "workspace_read_file",
+        arguments: '{"path":"README.md"}',
+      },
+      {
+        type: "function_call_output",
+        call_id: "call_keep_123",
+        output: '{"ok":true}',
+      },
+    ],
+    stream: false,
+  };
+
+  const result = executor.transformRequest("gpt-5.5-low", body, false, {
+    requestEndpointPath: "/responses",
+  });
+
+  assert.equal(
+    result.input.some((item) => JSON.stringify(item).includes("Need maybe inspect tool output")),
+    false
+  );
+  assert.equal(
+    result.input.some((item) => JSON.stringify(item).includes("Visible final assistant answer")),
+    true
+  );
+  assert.equal(
+    result.input.some((item) =>
+      JSON.stringify(item).includes("Visible final_answer assistant answer")
+    ),
+    true
+  );
+  assert.equal(
+    result.input.some((item) =>
+      JSON.stringify(item).includes("Visible assistant history without phase")
+    ),
+    true
+  );
+  assert.equal(
+    result.input.some((item) => item.type === "reasoning"),
+    true
+  );
+  assert.equal(
+    result.input.some((item) => item.type === "function_call"),
+    true
+  );
+  assert.equal(
+    result.input.some((item) => item.type === "function_call_output"),
+    true
+  );
+});
+
+test("CodexExecutor.transformRequest strips internal assistant commentary before mapping messages to input", () => {
+  const executor = new CodexExecutor();
+  const result = executor.transformRequest(
+    "gpt-5.5-low",
+    {
+      _nativeCodexPassthrough: true,
+      messages: [
+        { role: "user", content: "Continue." },
+        {
+          role: "assistant",
+          phase: "commentary",
+          content: "Need maybe update PR body first.",
+        },
+        {
+          role: "assistant",
+          phase: "final",
+          content: "Visible final assistant answer.",
+        },
+      ],
+      stream: false,
+    },
+    false,
+    { requestEndpointPath: "/responses" }
+  );
+
+  assert.equal(
+    result.input.some((item) => JSON.stringify(item).includes("Need maybe update PR body")),
+    false
+  );
+  assert.equal(
+    result.input.some((item) => JSON.stringify(item).includes("Visible final assistant answer")),
+    true
+  );
+  assert.equal(result.messages, undefined);
+});
+
+test("CodexExecutor.transformRequest does not locally replay previous_response_id tool follow-ups", () => {
+  const executor = new CodexExecutor();
+  const body = {
+    _nativeCodexPassthrough: true,
+    previous_response_id: "resp_prev_tool_123",
+    input: [
+      {
+        type: "function_call_output",
+        call_id: "call_tool_123",
+        output: '{"ok":true}',
+      },
+    ],
+    stream: false,
+  };
+
+  const result = executor.transformRequest("gpt-5.5-low", body, false, {
+    requestEndpointPath: "/responses",
+  });
+
+  assert.equal(result.previous_response_id, "resp_prev_tool_123");
+  assert.equal(result.store, false);
+  assert.equal(result.input.length, 1);
+  assert.deepEqual(result.input[0], {
+    type: "function_call_output",
+    call_id: "call_tool_123",
+    output: '{"ok":true}',
+  });
+});
 test("CodexExecutor.transformRequest applies per-connection reasoning and service tier defaults", () => {
   const executor = new CodexExecutor();
   const result = executor.transformRequest(
@@ -354,6 +635,61 @@ test("CodexExecutor.transformRequest keeps gpt-5.5 as the model and applies xhig
   assert.equal(result.reasoning.effort, "xhigh");
 });
 
+test("CodexExecutor.transformRequest merges Codex installation metadata", () => {
+  const executor = new CodexExecutor();
+  const result = executor.transformRequest(
+    "gpt-5.5",
+    {
+      model: "gpt-5.5",
+      input: [],
+      client_metadata: { existing: "keep" },
+    },
+    true,
+    {
+      providerSpecificData: {
+        codexClientIdentity: {
+          sessionId: "session-1",
+          turnId: "turn-1",
+          windowId: "session-1:0",
+          installationId: "11111111-1111-4111-a111-111111111111",
+        },
+      },
+    }
+  );
+
+  assert.deepEqual(result.client_metadata, {
+    existing: "keep",
+    "x-codex-installation-id": "11111111-1111-4111-a111-111111111111",
+  });
+});
+
+test("CodexExecutor.transformRequest omits client metadata for compact requests", () => {
+  const executor = new CodexExecutor();
+  const result = executor.transformRequest(
+    "gpt-5.5",
+    {
+      model: "gpt-5.5",
+      input: [],
+      client_metadata: { existing: "drop" },
+      _nativeCodexPassthrough: true,
+    },
+    false,
+    {
+      requestEndpointPath: "/responses/compact",
+      providerSpecificData: {
+        codexClientIdentity: {
+          sessionId: "session-1",
+          turnId: "turn-1",
+          windowId: "session-1:0",
+          installationId: "11111111-1111-4111-a111-111111111111",
+        },
+      },
+    }
+  );
+
+  assert.equal(result.client_metadata, undefined);
+});
+
 test("CodexExecutor.execute falls back to HTTP when websocket transport is unavailable", async () => {
   __setCodexWebSocketTransportForTesting(null);
   const executor = new CodexExecutor();
@@ -379,7 +715,89 @@ test("CodexExecutor.execute falls back to HTTP when websocket transport is unava
     // When WS transport is unavailable, isCodexResponsesWebSocketRequired returns false
     // and the executor falls back to HTTP via super.execute()
     assert.equal(result.response.status, 200);
-    assert.equal(result.transformedBody.model, "gpt-5.5");
+    assert.equal(getRecord(result.transformedBody).model, "gpt-5.5");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("CodexExecutor.execute adds CLI-like session identity headers without changing response flow", async () => {
+  const executor = new CodexExecutor();
+  const originalFetch = globalThis.fetch;
+  let capturedBody: Record<string, unknown> | null = null;
+  let capturedHeaders: Headers | null = null;
+
+  globalThis.fetch = async (_url, init) => {
+    capturedHeaders = new Headers(init?.headers as HeadersInit);
+    capturedBody = JSON.parse(String(init?.body || "{}"));
+    return new Response(JSON.stringify({ id: "resp_identity", object: "response" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    const result = await executor.execute({
+      model: "gpt-5.5",
+      body: {
+        model: "gpt-5.5",
+        session_id: "conversation-1",
+        input: [{ role: "user", content: "hello" }],
+      },
+      stream: true,
+      credentials: {
+        accessToken: "codex-token",
+        providerSpecificData: { workspaceId: "workspace-1" },
+      },
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.equal(capturedHeaders?.get("session_id"), "conversation-1");
+    assert.equal(capturedHeaders?.get("x-client-request-id"), "conversation-1");
+    assert.equal(capturedHeaders?.get("x-codex-window-id"), "conversation-1:0");
+    const turnMetadata = JSON.parse(capturedHeaders?.get("x-codex-turn-metadata") || "{}");
+    assert.equal(turnMetadata.session_id, "conversation-1");
+    assert.equal(turnMetadata.thread_source, "user");
+    assert.equal(turnMetadata.sandbox, "none");
+    assert.equal(typeof turnMetadata.turn_id, "string");
+    assert.equal(capturedBody?.prompt_cache_key, "conversation-1");
+    assert.equal(
+      (capturedBody?.client_metadata as Record<string, unknown>)?.["x-codex-installation-id"],
+      "7f06a8ee-2981-4c81-a4ca-e443b5400a63"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("CodexExecutor.execute skips identity headers for unsafe session ids", async () => {
+  const executor = new CodexExecutor();
+  const originalFetch = globalThis.fetch;
+  let capturedHeaders: Headers | null = null;
+
+  globalThis.fetch = async (_url, init) => {
+    capturedHeaders = new Headers(init?.headers as HeadersInit);
+    return new Response(JSON.stringify({ id: "resp_identity", object: "response" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    await executor.execute({
+      model: "gpt-5.5",
+      body: {
+        model: "gpt-5.5",
+        session_id: "bad\r\nheader",
+        input: [{ role: "user", content: "hello" }],
+      },
+      stream: true,
+      credentials: { accessToken: "codex-token" },
+    });
+
+    assert.equal(capturedHeaders?.get("x-client-request-id"), null);
+    assert.equal(capturedHeaders?.get("x-codex-window-id"), null);
+    assert.equal(capturedHeaders?.get("x-codex-turn-metadata"), null);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -509,6 +927,27 @@ test("CodexExecutor.refreshCredentials refreshes OAuth tokens and returns null w
       refreshToken: "new-refresh",
       expiresIn: 3600,
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("CodexExecutor.refreshCredentials returns null for unrecoverable errors to preserve original credentials", async () => {
+  // Source intentionally returns null (not an error object) so that base.ts does
+  // not spread stale error fields onto activeCredentials. The upstream 401/403
+  // drives the proper re-auth / mark-expired path instead.
+  // Source: open-sse/executors/codex.ts — refreshCredentials(), lines ~1205-1216.
+  const executor = new CodexExecutor();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({ error: "invalid_grant", error_description: "Refresh token expired" }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+
+  try {
+    const result = await executor.refreshCredentials({ refreshToken: "dead-token" }, null);
+    assert.equal(result, null, "should return null to leave original credentials untouched");
   } finally {
     globalThis.fetch = originalFetch;
   }

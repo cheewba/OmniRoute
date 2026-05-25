@@ -12,6 +12,7 @@ const providersDb = await import("../../src/lib/db/providers.ts");
 const modelsDb = await import("../../src/lib/db/models.ts");
 const providerModelsRoute = await import("../../src/app/api/providers/[id]/models/route.ts");
 const antigravityVersion = await import("../../open-sse/services/antigravityVersion.ts");
+const providerRegistry = await import("../../open-sse/config/providerRegistry.ts");
 
 const originalFetch = globalThis.fetch;
 const originalAllowPrivateProviderUrls = process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS;
@@ -205,7 +206,11 @@ test("provider models route returns static catalog entries for providers with ha
 
   assert.equal(response.status, 200);
   assert.equal(body.provider, "bailian-coding-plan");
-  assert.equal(body.models.length, 8);
+  assert.equal(body.models.length, providerRegistry.REGISTRY["bailian-coding-plan"].models?.length);
+  assert.deepEqual(
+    body.models.map((model) => model.id),
+    providerRegistry.REGISTRY["bailian-coding-plan"].models?.map((model) => model.id)
+  );
 });
 
 test("provider models route returns AWS Polly speech engines from the audio registry", async () => {
@@ -350,13 +355,28 @@ test("provider models route returns the local catalog for embedding and rerank p
   assert.equal(voyageBody.provider, "voyage-ai");
   assert.equal(voyageBody.source, "local_catalog");
   assert.ok(voyageBody.models.some((model) => model.id === "voyage-4-large"));
-  assert.ok(voyageBody.models.some((model) => model.id === "voyage-3-large"));
+  assert.ok(voyageBody.models.some((model) => model.id === "voyage-code-3"));
 
   assert.equal(jinaResponse.status, 200);
   assert.equal(jinaBody.provider, "jina-ai");
   assert.equal(jinaBody.source, "local_catalog");
-  assert.ok(jinaBody.models.some((model) => model.id === "jina-reranker-v3"));
-  assert.ok(jinaBody.models.some((model) => model.id === "jina-reranker-v2-base-multilingual"));
+  assert.ok(
+    jinaBody.models.some(
+      (model) =>
+        model.id === "jina-embeddings-v5-text-small" &&
+        model.apiFormat === "embeddings" &&
+        model.supportedEndpoints?.includes("embeddings")
+    )
+  );
+  assert.ok(
+    jinaBody.models.some(
+      (model) =>
+        model.id === "jina-reranker-v3" &&
+        model.apiFormat === "rerank" &&
+        model.supportedEndpoints?.includes("rerank")
+    )
+  );
+  assert.ok(jinaBody.models.some((model) => model.id === "jina-reranker-m0"));
 });
 
 test("provider models route returns the local catalog for Runway video models", async () => {
@@ -432,7 +452,26 @@ test("provider models route returns the local catalog for new built-in chat-open
   assert.match(body.warning, /local catalog/i);
   assert.ok(Array.isArray(body.models));
   assert.ok(body.models.length > 0);
-  assert.ok(body.models.some((model) => model.id === "Qwen/Qwen3-Coder-480B-A35B-Instruct"));
+  assert.ok(body.models.some((model) => model.id === "openai/gpt-oss-120b"));
+});
+
+test("provider models route merges Upstage chat and embedding catalogs", async () => {
+  const connection = await seedConnection("upstage", {
+    apiKey: "upstage-key",
+  });
+
+  const response = await callRoute(connection.id);
+  const body = (await response.json()) as any;
+  const modelIds = body.models.map((model) => model.id);
+
+  assert.equal(response.status, 200);
+  assert.equal(body.provider, "upstage");
+  assert.equal(body.source, "local_catalog");
+  assert.ok(modelIds.includes("solar-pro3"));
+  assert.ok(modelIds.includes("solar-mini"));
+  assert.ok(modelIds.includes("embedding-query"));
+  assert.ok(modelIds.includes("embedding-passage"));
+  assert.equal(modelIds.includes("document-parse"), false);
 });
 
 test("provider models route caches discovered opencode-go models per connection", async () => {
@@ -461,7 +500,7 @@ test("provider models route caches discovered opencode-go models per connection"
   assert.equal(firstResponse.status, 200);
   assert.equal(firstBody.source, "api");
   assert.deepEqual(firstBody.models, [{ id: "glm-5.1", name: "GLM 5.1" }]);
-  assert.deepEqual(cachedModels, [{ id: "glm-5.1", name: "GLM 5.1", source: "api-sync" }]);
+  assert.deepEqual(cachedModels, [{ id: "glm-5.1", name: "GLM 5.1", source: "imported" }]);
 
   globalThis.fetch = async () => {
     throw new Error("cached route should not hit upstream");
@@ -472,7 +511,7 @@ test("provider models route caches discovered opencode-go models per connection"
 
   assert.equal(cachedResponse.status, 200);
   assert.equal(cachedBody.source, "cache");
-  assert.deepEqual(cachedBody.models, [{ id: "glm-5.1", name: "GLM 5.1", source: "api-sync" }]);
+  assert.deepEqual(cachedBody.models, [{ id: "glm-5.1", name: "GLM 5.1", source: "imported" }]);
   assert.equal(fetchCalls, 1);
 });
 
@@ -481,7 +520,7 @@ test("provider models route falls back to cached models when a refresh fails", a
     apiKey: "opencode-go-key",
   });
   await modelsDb.replaceSyncedAvailableModelsForConnection("opencode-go", connection.id, [
-    { id: "cached-go", name: "Cached Go", source: "api-sync" },
+    { id: "cached-go", name: "Cached Go", source: "imported" },
   ]);
   let fetchCalls = 0;
 
@@ -496,7 +535,7 @@ test("provider models route falls back to cached models when a refresh fails", a
   assert.equal(response.status, 200);
   assert.equal(body.source, "cache");
   assert.match(body.warning, /cached catalog/i);
-  assert.deepEqual(body.models, [{ id: "cached-go", name: "Cached Go", source: "api-sync" }]);
+  assert.deepEqual(body.models, [{ id: "cached-go", name: "Cached Go", source: "imported" }]);
   assert.equal(fetchCalls, 1);
 });
 
@@ -505,7 +544,7 @@ test("provider models route clears cached discovery when a refresh returns no re
     apiKey: "opencode-go-key",
   });
   await modelsDb.replaceSyncedAvailableModelsForConnection("opencode-go", connection.id, [
-    { id: "cached-go", name: "Cached Go", source: "api-sync" },
+    { id: "cached-go", name: "Cached Go", source: "imported" },
   ]);
 
   globalThis.fetch = async () => {
@@ -606,18 +645,26 @@ test("provider models route retries Antigravity discovery endpoints before retur
     accessToken: "ag-access",
     apiKey: null,
   });
-  const seenUrls = [];
+  const seenUrls: string[] = [];
   antigravityVersion.seedAntigravityVersionCache("1.22.2");
 
   globalThis.fetch = async (url, init = {}) => {
-    seenUrls.push(String(url));
+    const urlString = String(url);
+    // After PR #2219, the discovery flow calls loadCodeAssist first as a project
+    // bootstrap; treat all bootstrap calls as non-fatal failures so the test
+    // exercises the discovery retry path.
+    if (urlString.includes("/v1internal:loadCodeAssist")) {
+      return new Response("nope", { status: 503 });
+    }
+    seenUrls.push(urlString);
     if (seenUrls.length === 1) {
       return new Response("unavailable", { status: 503 });
     }
 
     assert.equal(init.method, "POST");
     assert.equal(init.headers.Authorization, "Bearer ag-access");
-    assert.match(init.headers["User-Agent"], /^antigravity\//);
+    assert.match(init.headers["User-Agent"], /^Antigravity\/1\.22\.2 /);
+    assert.equal(init.headers["x-goog-api-client"], undefined);
     return Response.json({
       models: [{ id: "gemini-3-flash", displayName: "Gemini 3 Flash" }],
     });
@@ -625,13 +672,20 @@ test("provider models route retries Antigravity discovery endpoints before retur
 
   const response = await callRoute(connection.id);
   const body = (await response.json()) as any;
-  const discoveryUrls = seenUrls.filter((url) => url.includes("/v1internal:models"));
+  // After PR #2219, the route tries `:fetchAvailableModels` URLs before
+  // `:models` URLs. The test mock returns 503 on the first call and success
+  // on the second, so only the first two `:fetchAvailableModels` URLs are
+  // hit — `:models` URLs are never reached. Assert on the actual discovery
+  // sequence the route follows.
+  const discoveryUrls = seenUrls.filter(
+    (url) => url.includes("/v1internal:fetchAvailableModels") || url.includes("/v1internal:models")
+  );
 
   assert.equal(response.status, 200);
   assert.equal(body.source, "api");
   assert.deepEqual(discoveryUrls, [
-    "https://cloudcode-pa.googleapis.com/v1internal:models",
-    "https://daily-cloudcode-pa.googleapis.com/v1internal:models",
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
   ]);
   assert.deepEqual(body.models, [{ id: "gemini-3-flash-preview", name: "Gemini 3 Flash" }]);
 });
@@ -657,8 +711,8 @@ test("provider models route falls back through all Antigravity discovery endpoin
   assert.equal(body.source, "local_catalog");
   assert.match(body.warning, /local catalog/i);
   assert.deepEqual(discoveryUrls, [
-    "https://cloudcode-pa.googleapis.com/v1internal:models",
     "https://daily-cloudcode-pa.googleapis.com/v1internal:models",
+    "https://cloudcode-pa.googleapis.com/v1internal:models",
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:models",
   ]);
   assert.ok(body.models.some((model) => model.id === "gemini-3-pro-preview"));
@@ -1224,7 +1278,7 @@ test("provider models route discovers Modal models from the configured OpenAI-co
   ]);
 });
 
-test("provider models route discovers Reka models from the named OpenAI-compatible /v1 endpoint", async () => {
+test("provider models route always returns the Reka preset catalog", async () => {
   const connection = await seedConnection("reka", {
     apiKey: "reka-key",
     providerSpecificData: {
@@ -1232,13 +1286,8 @@ test("provider models route discovers Reka models from the named OpenAI-compatib
     },
   });
 
-  globalThis.fetch = async (url, init = {}) => {
-    assert.equal(String(url), "https://api.reka.ai/v1/models");
-    assert.equal(init.method, "GET");
-    assert.equal(init.headers.Authorization, "Bearer reka-key");
-    assert.equal(init.headers["X-Api-Key"], "reka-key");
-
-    return Response.json([{ id: "reka-core", name: "Reka Core" }, { id: "reka-flash" }]);
+  globalThis.fetch = async () => {
+    throw new Error("Reka models endpoint should not be probed");
   };
 
   const response = await callRoute(connection.id);
@@ -1246,19 +1295,34 @@ test("provider models route discovers Reka models from the named OpenAI-compatib
 
   assert.equal(response.status, 200);
   assert.equal(body.provider, "reka");
-  assert.equal(body.source, "api");
-  assert.deepEqual(body.models, [
-    {
-      id: "reka-core",
-      name: "Reka Core",
-      owned_by: "reka",
+  assert.equal(body.source, "local_catalog");
+  assert.deepEqual(
+    body.models.map((model) => model.id),
+    ["reka-flash-3", "reka-edge-2603"]
+  );
+});
+
+test("provider models route returns Reka local catalog without an API key", async () => {
+  const connection = await seedConnection("reka", {
+    providerSpecificData: {
+      baseUrl: "https://api.reka.ai/v1",
     },
-    {
-      id: "reka-flash",
-      name: "reka-flash",
-      owned_by: "reka",
-    },
-  ]);
+  });
+
+  globalThis.fetch = async () => {
+    throw new Error("Reka models endpoint should not be probed without a token");
+  };
+
+  const response = await callRoute(connection.id);
+  const body = (await response.json()) as any;
+
+  assert.equal(response.status, 200);
+  assert.equal(body.provider, "reka");
+  assert.equal(body.source, "local_catalog");
+  assert.deepEqual(
+    body.models.map((model) => model.id),
+    ["reka-flash-3", "reka-edge-2603"]
+  );
 });
 
 test("provider models route discovers SAP models from AI_API_URL derived from deploymentUrl", async () => {

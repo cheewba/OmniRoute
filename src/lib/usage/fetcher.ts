@@ -7,11 +7,8 @@ import {
   getGitHubCopilotInternalUserHeaders,
   getKiroServiceHeaders,
 } from "@omniroute/open-sse/config/providerHeaderProfiles.ts";
-import {
-  getAntigravityHeaders,
-  antigravityUserAgent,
-  googApiClientHeader,
-} from "@omniroute/open-sse/services/antigravityHeaders.ts";
+import { applyAntigravityClientProfileHeaders } from "@omniroute/open-sse/services/antigravityClientProfile.ts";
+import { getAntigravityHeaders } from "@omniroute/open-sse/services/antigravityHeaders.ts";
 import {
   getAntigravityFetchAvailableModelsUrls,
   ANTIGRAVITY_BASE_URLS,
@@ -21,6 +18,10 @@ import {
   updateAntigravityRemainingCredits,
 } from "@omniroute/open-sse/executors/antigravity.ts";
 import { getCreditsMode } from "@omniroute/open-sse/services/antigravityCredits.ts";
+import {
+  generateAntigravityRequestId,
+  getAntigravitySessionId,
+} from "@omniroute/open-sse/services/antigravityIdentity.ts";
 
 /**
  * Get usage data for a provider connection
@@ -176,7 +177,8 @@ async function getGeminiUsage(accessToken) {
 async function probeAntigravityCreditBalance(
   accessToken: string,
   accountId: string,
-  projectId?: string | null
+  projectId?: string | null,
+  providerSpecificData: Record<string, unknown> = {}
 ): Promise<number | null> {
   try {
     if (!projectId) return null; // Can't call streamGenerateContent without a projectId
@@ -189,22 +191,26 @@ async function probeAntigravityCreditBalance(
       model: "gemini-2-flash",
       userAgent: "antigravity",
       requestType: "agent",
-      requestId: `credits-probe-${Date.now()}`,
+      requestId: generateAntigravityRequestId(),
       enabledCreditTypes: ["GOOGLE_ONE_AI"],
       request: {
         model: "gemini-2-flash",
         contents: [{ role: "user", parts: [{ text: "hi" }] }],
         generationConfig: { maxOutputTokens: 1 },
+        sessionId: getAntigravitySessionId({ connectionId: accountId, projectId }),
       },
     };
 
-    const headers = {
+    const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`,
-      "User-Agent": antigravityUserAgent(),
-      "X-Goog-Api-Client": googApiClientHeader(),
       Accept: "text/event-stream",
     };
+    applyAntigravityClientProfileHeaders(
+      headers,
+      { connectionId: accountId, projectId, providerSpecificData },
+      body
+    );
 
     const res = await fetch(url, {
       method: "POST",
@@ -275,7 +281,12 @@ async function getAntigravityUsage(
     // If no cached balance and credits mode is enabled, fire a minimal probe
     const creditsMode = getCreditsMode();
     if (creditBalance === null && creditsMode !== "off") {
-      creditBalance = await probeAntigravityCreditBalance(accessToken, accountId, projectId);
+      creditBalance = await probeAntigravityCreditBalance(
+        accessToken,
+        accountId,
+        projectId,
+        providerSpecificData
+      );
     }
 
     // fetchAvailableModels — resolves project from token, no projectId needed

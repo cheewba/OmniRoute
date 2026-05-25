@@ -633,10 +633,10 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
 
       let argsToEmit = item.arguments;
       if (argsToEmit != null && typeof argsToEmit === "object" && !Array.isArray(argsToEmit)) {
-        // Fix #1674: Strip empty string placeholders emitted by GPT-5.5 for optional fields
+        // Fix #1674 & #1852: Strip empty string and array placeholders emitted by GPT-5.5 for optional fields
         const cleaned = { ...argsToEmit };
         for (const [k, v] of Object.entries(cleaned)) {
-          if (v === "") delete cleaned[k];
+          if (v === "" || (Array.isArray(v) && v.length === 0)) delete cleaned[k];
         }
         argsToEmit = cleaned;
       }
@@ -685,7 +685,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
       if (argsToEmit != null && typeof argsToEmit === "object" && !Array.isArray(argsToEmit)) {
         const cleaned = { ...argsToEmit };
         for (const [k, v] of Object.entries(cleaned)) {
-          if (v === "") delete cleaned[k];
+          if (v === "" || (Array.isArray(v) && v.length === 0)) delete cleaned[k];
         }
         argsToEmit = cleaned;
       }
@@ -823,10 +823,18 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     };
   }
 
-  // Handle true reasoning summary ("Thought for 15s")
+  // Handle true reasoning summary ("Thought for 15s").
+  // Emit as `delta.reasoning_content` — matches the shape used by the
+  // `reasoning_content_text.delta` branch above and is what Chat clients
+  // (OpenCode, Claude Code, Cursor, etc.) actually render in their thinking
+  // panel. A nested `delta.reasoning.summary` object is swallowed by most
+  // stream mergers and never reaches the user.
   if (eventType === "response.reasoning_summary_text.delta") {
     const reasoningDelta = data.delta || "";
     if (!reasoningDelta) return null;
+    const reasoningDeltaShape = state.copilotCompatibleReasoning
+      ? { reasoning_text: reasoningDelta }
+      : { reasoning_content: reasoningDelta };
     return {
       id: state.chatId,
       object: "chat.completion.chunk",
@@ -835,7 +843,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
       choices: [
         {
           index: 0,
-          delta: { reasoning: { summary: reasoningDelta } },
+          delta: reasoningDeltaShape,
           finish_reason: null,
         },
       ],

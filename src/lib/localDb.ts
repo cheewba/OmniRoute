@@ -13,6 +13,7 @@ export {
   createProviderConnection,
   updateProviderConnection,
   deleteProviderConnection,
+  deleteProviderConnections,
   deleteProviderConnectionsByProvider,
   reorderProviderConnections,
   cleanupProviderConnections,
@@ -64,6 +65,7 @@ export {
   getAllSyncedAvailableModels,
   replaceSyncedAvailableModelsForConnection,
   deleteSyncedAvailableModelsForConnection,
+  deleteSyncedAvailableModelsForProvider,
 } from "./db/models";
 
 export type { ModelCompatPerProtocol, ModelCompatPatch, SyncedAvailableModel } from "./db/models";
@@ -79,6 +81,9 @@ export {
   deleteCombo,
 } from "./db/combos";
 
+export * from "./db/compressionCacheStats";
+export * from "./db/compressionCombos";
+
 export {
   // API Keys
   getApiKeys,
@@ -88,6 +93,7 @@ export {
   validateApiKey,
   getApiKeyMetadata,
   updateApiKeyPermissions,
+  regenerateApiKey,
   isModelAllowedForKey,
   clearApiKeyCaches,
   resetApiKeyState,
@@ -144,11 +150,20 @@ export {
 export type { PricingSource, PricingSourceMap } from "./db/settings";
 
 export {
+  getDatabaseSettings,
+  getUserDatabaseSettings,
+  updateDatabaseSettings,
+} from "./db/databaseSettings";
+
+export type { UserDatabaseSettings } from "./db/databaseSettings";
+
+export {
   // Proxy Registry
   listProxies,
   getProxyById,
   createProxy,
   updateProxy,
+  upsertProxy,
   deleteProxyById,
   getProxyAssignments,
   getProxyWhereUsed,
@@ -232,7 +247,7 @@ export {
   getFile,
   getFileContent,
   listFiles,
-  updateFileStatus,
+  countFiles,
   formatFileResponse,
   deleteFile,
 } from "./db/files";
@@ -243,8 +258,11 @@ export {
   getBatch,
   updateBatch,
   listBatches,
+  countBatches,
   getPendingBatches,
   getTerminalBatches,
+  deleteBatch,
+  deleteCompletedBatches,
 } from "./db/batches";
 
 export type { FileRecord } from "./db/files";
@@ -272,6 +290,8 @@ export {
   getAggregatedSnapshots,
   cleanupOldSnapshots,
 } from "./db/quotaSnapshots";
+
+export * from "./db/sessionAccountAffinity";
 
 export type { QuotaSnapshotRow, ProviderUtilizationPoint } from "@/shared/types/utilization";
 
@@ -323,14 +343,147 @@ export {
 } from "./db/creditBalance";
 
 export {
+  insertCompressionAnalyticsRow,
+  getCompressionAnalyticsSummary,
+} from "./db/compressionAnalytics";
+
+export type {
+  CompressionAnalyticsRow,
+  CompressionAnalyticsSummary,
+} from "./db/compressionAnalytics";
+
+export {
   // Reasoning Replay Cache (#1628)
   setReasoningCache,
   getReasoningCache,
   deleteReasoningCache,
-  cleanupExpiredReasoning,
-  getReasoningCacheStats,
-  getReasoningCacheEntries,
   clearAllReasoningCache,
 } from "./db/reasoningCache";
 
 export type { ReasoningCacheEntry, ReasoningCacheStats } from "./db/reasoningCache";
+
+export {
+  // 1proxy Integration (#1788)
+  listOneproxyProxies,
+  getOneproxyStats,
+  upsertOneproxyProxy,
+  getOneproxyProxyById,
+  deleteOneproxyProxy,
+  clearAllOneproxyProxies,
+  getOneproxyProxyForRotation,
+  markOneproxyProxyFailed,
+} from "./db/oneproxy";
+
+export type { OneproxyProxyRecord, OneproxyStats } from "./db/oneproxy";
+
+export {
+  getSessionAccountAffinity,
+  upsertSessionAccountAffinity,
+  touchSessionAccountAffinity,
+  deleteSessionAccountAffinity,
+  cleanupStaleSessionAccountAffinities,
+  startSessionAccountAffinityCleanup,
+  stopSessionAccountAffinityCleanupForTests,
+} from "./db/sessionAccountAffinity";
+
+export {
+  // Gamification & Leaderboard
+  updateScore,
+  getRank,
+  getTopN,
+  addXp,
+  getXp,
+  updateLevel,
+  unlockBadge,
+  getBadges,
+  getBadgeDefinitions,
+  transferTokens,
+  getBalance,
+  getHistory,
+  createInviteToken,
+  getInviteByCode,
+  redeemInvite,
+  revokeInvite,
+  connectServer,
+  disconnectServer,
+  listServers,
+} from "./db/gamification";
+
+export type {
+  LeaderboardRow,
+  UserLevelRow,
+  BadgeDefinition,
+  UserBadge,
+  XpAuditLogEntry,
+  TokenLedgerEntry,
+  InviteToken,
+  CommunityServer,
+} from "./db/gamification";
+
+export * from "./db/featureFlags";
+
+export {
+  upsertHandoff,
+  getHandoff,
+  deleteHandoff,
+  cleanupExpiredHandoffs,
+  hasActiveHandoff,
+  recordSessionModelUsage,
+  getLastSessionModel,
+} from "./db/contextHandoffs";
+
+export type { HandoffPayload } from "./db/contextHandoffs";
+
+export {
+  getAllMiddlewareHooks,
+  getEnabledMiddlewareHooks,
+  getComboMiddlewareHooks,
+  getMiddlewareHook,
+  createMiddlewareHook,
+  updateMiddlewareHook,
+  deleteMiddlewareHook,
+  recordHookExecution,
+  insertHookLog,
+  getHookLogs,
+  cleanupHookLogs,
+} from "./db/middleware";
+
+export {
+  getAllKeyGroups,
+  getKeyGroup,
+  getKeyGroupWithPermissions,
+  createKeyGroup,
+  updateKeyGroup,
+  deleteKeyGroup,
+  getGroupPermissions,
+  addGroupPermission,
+  removeGroupPermission,
+  clearGroupPermissions,
+  getGroupMembers,
+  getKeyGroupsForApiKey,
+  addKeyToGroup,
+  removeKeyFromGroup,
+  checkKeyModelAccess,
+} from "./db/apiKeyGroups";
+
+export {
+  createRelayToken,
+  getRelayTokens,
+  getRelayToken,
+  getRelayTokenByHash,
+  updateRelayToken,
+  deleteRelayToken,
+  toggleRelayToken,
+  checkRateLimit,
+  recordRelayUsage,
+  getRelayUsage,
+  getRelayLogs,
+} from "./db/relayProxies";
+
+export type {
+  RelayToken,
+  RelayTokenRow,
+  RelayLogRow,
+  CreateRelayTokenInput,
+  RelayTokenWithSecret,
+} from "./db/relayProxies";

@@ -217,6 +217,51 @@ describe("Server Readiness Logic", () => {
     const result = await waitForServer("http://localhost:59999", 100);
     assert.equal(result, false);
   });
+
+  // #2460: on a slow first launch (long DB migrations) the initial readiness probe can
+  // time out. The window must not be left on a hanging connection — a background retry
+  // must keep polling and reload the window once the server finally responds.
+  it("reloads the window once the server becomes ready after an initial timeout (#2460)", async () => {
+    let serverUp = false;
+    // Server "comes up" after ~60ms, simulating long first-launch migrations.
+    const upTimer = setTimeout(() => {
+      serverUp = true;
+    }, 60);
+
+    async function waitForServer(_url, timeoutMs) {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        if (serverUp) return true;
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      return false;
+    }
+
+    try {
+      // Initial probe with a short budget times out (server not up yet).
+      const initialReady = await waitForServer("http://localhost/api/monitoring/health", 20);
+      assert.equal(initialReady, false);
+
+      let reloaded = false;
+      const mainWindow = {
+        isDestroyed: () => false,
+        loadURL: () => {
+          reloaded = true;
+        },
+      };
+
+      // Background retry with a generous budget should succeed and reload the window.
+      const retryReady = await waitForServer("http://localhost/api/monitoring/health", 5000);
+      if (retryReady && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.loadURL("http://localhost");
+      }
+
+      assert.equal(retryReady, true);
+      assert.equal(reloaded, true, "window should reload once the server is ready");
+    } finally {
+      clearTimeout(upTimer);
+    }
+  });
 });
 
 // ─── Restart Timeout Tests (#2) ──────────────────────────────
@@ -246,20 +291,33 @@ describe("Content Security Policy", () => {
       "default-src",
       "connect-src",
       "script-src",
+      "script-src-attr",
       "style-src",
       "font-src",
       "img-src",
       "media-src",
+      "object-src",
+      "frame-src",
+      "child-src",
     ];
 
     const csp = [
       "default-src 'self'",
-      "connect-src 'self' http://localhost:* ws://localhost:*",
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      "base-uri 'self'",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+      "frame-src 'none'",
+      "child-src 'none'",
+      "form-action 'self'",
+      "script-src 'self' 'unsafe-inline' blob:",
+      "script-src-attr 'none'",
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
       "font-src 'self' https://fonts.gstatic.com data:",
       "img-src 'self' data: blob: https:",
-      "media-src 'self'",
+      "media-src 'self' data: blob:",
+      "connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*",
+      "worker-src 'self' blob:",
+      "manifest-src 'self'",
     ].join("; ");
 
     for (const directive of directives) {
@@ -268,9 +326,10 @@ describe("Content Security Policy", () => {
   });
 
   it("should not allow unsafe script sources from external domains", () => {
-    const scriptSrc = "script-src 'self' 'unsafe-inline' 'unsafe-eval'";
-    assert.ok(!scriptSrc.includes("http://"), "Should not allow external http scripts");
-    assert.ok(!scriptSrc.includes("*"), "Should not wildcard script sources");
+    const scriptSrc = "script-src 'self' 'unsafe-inline' blob:";
+    assert.equal(scriptSrc.indexOf("http://"), -1, "Should not allow external http scripts");
+    assert.equal(scriptSrc.indexOf("*"), -1, "Should not wildcard script sources");
+    assert.equal(scriptSrc.indexOf("'unsafe-eval'"), -1, "Production CSP should not allow eval");
   });
 });
 

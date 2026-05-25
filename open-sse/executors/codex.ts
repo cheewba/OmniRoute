@@ -3,15 +3,28 @@ import {
   BaseExecutor,
   mergeUpstreamExtraHeaders,
   setUserAgentHeader,
+  type ExecutorLog,
   type ExecuteInput,
+  type ProviderCredentials,
 } from "./base.ts";
 import {
   CODEX_CHAT_DEFAULT_INSTRUCTIONS,
   CODEX_DEFAULT_INSTRUCTIONS,
 } from "../config/codexInstructions.ts";
 import { PROVIDERS } from "../config/constants.ts";
-import { getCodexClientVersion, getCodexUserAgent } from "../config/codexClient.ts";
+import {
+  getCodexClientVersion,
+  getCodexUserAgent,
+  normalizeCodexSessionId,
+} from "../config/codexClient.ts";
+import {
+  applyCodexClientIdentityHeaders,
+  applyCodexClientMetadata,
+  createCodexClientIdentity,
+  type CodexClientIdentity,
+} from "../config/codexIdentity.ts";
 import { getAccessToken } from "../services/tokenRefresh.ts";
+import { sanitizeResponsesInputItems } from "../services/responsesInputSanitizer.ts";
 import { getThinkingBudgetConfig, ThinkingMode } from "../services/thinkingBudget.ts";
 import { CORS_HEADERS } from "../utils/cors.ts";
 import { createRequire } from "module";
@@ -31,6 +44,11 @@ type WreqWebSocket = {
   onclose: (() => void) | null;
 };
 type WebsocketFn = (url: string, opts?: Record<string, unknown>) => Promise<WreqWebSocket>;
+type ResponsesMessageInput = {
+  role?: unknown;
+  phase?: unknown;
+  content?: unknown;
+};
 
 let _websocketFn: WebsocketFn | null = null;
 let _wreqChecked = false;
@@ -44,6 +62,7 @@ function getCodexWebSocketTransport(): WebsocketFn | null {
     const mod = _wreqRequire("wreq-js") as { websocket?: WebsocketFn };
     _websocketFn = typeof mod.websocket === "function" ? mod.websocket : null;
   } catch {
+    console.warn("[codex] wreq-js import failed, websocket disabled");
     _websocketFn = null;
   }
   return _websocketFn;
@@ -253,68 +272,11 @@ export function getCodexUpstreamModel(model: unknown): string {
   return splitCodexReasoningSuffix(model).baseModel;
 }
 
-function stringifyCodexInstructionContent(content: unknown): string {
-  if (typeof content === "string") {
-    return content.trim();
-  }
-
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === "string") return part.trim();
-        if (!part || typeof part !== "object") return "";
-        const record = part as Record<string, unknown>;
-        if (typeof record.text === "string") return record.text.trim();
-        if (typeof record.content === "string") return record.content.trim();
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n")
-      .trim();
-  }
-
-  return "";
-}
-
-function hoistSystemMessagesToInstructions(body: Record<string, unknown>): void {
-  if (!Array.isArray(body.input)) return;
-
-  const systemChunks: string[] = [];
-  const filteredInput = body.input.filter((itemValue) => {
-    if (!itemValue || typeof itemValue !== "object" || Array.isArray(itemValue)) {
-      return true;
-    }
-
-    const item = itemValue as Record<string, unknown>;
-    const role = typeof item.role === "string" ? item.role : "";
-    const type = typeof item.type === "string" ? item.type : "";
-    const isSystemMessage = role === "system" && (!type || type === "message");
-    if (!isSystemMessage) {
-      return true;
-    }
-
-    const text = stringifyCodexInstructionContent(item.content);
-    if (text) {
-      systemChunks.push(text);
-    }
-    return false;
-  });
-
-  if (systemChunks.length === 0) return;
-
-  const existingInstructions =
-    typeof body.instructions === "string" ? body.instructions.trim() : "";
-  body.instructions = existingInstructions
-    ? `${systemChunks.join("\n\n")}\n\n${existingInstructions}`
-    : systemChunks.join("\n\n");
-  body.input = filteredInput;
-}
-
 /**
  * Convert role=system messages in `input` to role=developer.
  *
  * GPT-5 models support the `developer` role in input, but reject `system`.
- * Unlike hoistSystemMessagesToInstructions(), this keeps the content inside
+ * This keeps the content inside
  * the `input` array where it benefits from OpenAI's automatic prompt caching.
  *
  * OpenAI's prompt caching matches on the serialized prefix of the `input` array
@@ -359,15 +321,17 @@ function convertSystemToDeveloperRole(body: Record<string, unknown>): void {
  *   3. Strips the "id" field from any object in input whose id matches a
  *      server-generated prefix (rs_, fc_, resp_, msg_) — so the content is
  *      preserved but the backend won't try to look it up
- *   4. Always deletes previous_response_id (endpoint doesn't persist responses)
  */
 function stripStoredItemReferences(body: Record<string, unknown>): void {
-  // Always strip previous_response_id — the /codex/responses endpoint does not
-  // persist responses, so any reference to a previous response would cause a 404.
-  // The official Codex CLI sets previous_response_id to None for HTTP transport.
-  // Ref: codex-rs codex-api/src/common.rs:187 — previous_response_id: None
-  // Ref: CLIProxyAPI codex_executor.go:115 — sjson.DeleteBytes(body, "previous_response_id")
-  delete body.previous_response_id;
+  if (Array.isArray(body.input) && body.input.length === 0) {
+    body.input = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "continue" }],
+      },
+    ];
+  }
 
   if (!Array.isArray(body.input)) return;
 
@@ -449,7 +413,7 @@ function normalizeCodexTools(body: Record<string, unknown>): void {
         for (const st of tool.tools as unknown[]) {
           if (st && typeof st === "object" && !Array.isArray(st)) {
             const subTool = st as Record<string, unknown>;
-            const name = typeof subTool.name === "string" ? subTool.name.trim() : "";
+            const name = typeof subTool.name === "string" ? subTool.name.trim().slice(0, 128) : "";
             if (name) validToolNames.add(name);
           }
         }
@@ -484,6 +448,40 @@ function normalizeCodexTools(body: Record<string, unknown>): void {
       return false;
     }
 
+    // Codex Responses API requires function tools in flat Responses format:
+    // { type: "function", name, description, parameters }
+    // Some clients/translators send Chat Completions shape:
+    // { type: "function", function: { name, description, parameters } }
+    // which upstream rejects with "Missing required parameter: tools[0].name".
+    // Flatten the nested `function` wrapper into top-level fields (#1914).
+    const functionObject =
+      tool.function && typeof tool.function === "object" && !Array.isArray(tool.function)
+        ? (tool.function as Record<string, unknown>)
+        : null;
+    const description =
+      typeof tool.description === "string"
+        ? tool.description
+        : typeof functionObject?.description === "string"
+          ? functionObject.description
+          : "";
+    const parameters =
+      tool.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters)
+        ? tool.parameters
+        : functionObject?.parameters &&
+            typeof functionObject.parameters === "object" &&
+            !Array.isArray(functionObject.parameters)
+          ? functionObject.parameters
+          : { type: "object", properties: {} };
+
+    // Rewrite in-place to Responses format
+    for (const key of Object.keys(tool)) {
+      delete tool[key];
+    }
+    tool.type = "function";
+    tool.name = name.slice(0, 128);
+    if (description) tool.description = description;
+    tool.parameters = parameters;
+
     validToolNames.add(name);
     return true;
   });
@@ -504,13 +502,30 @@ function normalizeCodexTools(body: Record<string, unknown>): void {
 }
 
 function getResponsesSubpath(endpointPath: unknown): string | null {
-  const normalizedEndpoint = String(endpointPath || "").replace(/\/+$/, "");
-  const match = normalizedEndpoint.match(/(?:^|\/)responses(?:(\/.*))?$/i);
-  if (!match) return null;
-  return match[1] || "";
+  let normalizedEndpoint = String(endpointPath || "");
+  while (normalizedEndpoint.endsWith("/") && normalizedEndpoint.length > 0) {
+    normalizedEndpoint = normalizedEndpoint.slice(0, -1);
+  }
+
+  const lower = normalizedEndpoint.toLowerCase();
+  if (lower === "responses" || lower.endsWith("/responses")) {
+    return "";
+  }
+
+  const responsesSlash = "/responses/";
+  const idx = lower.lastIndexOf(responsesSlash);
+  if (idx !== -1) {
+    return normalizedEndpoint.slice(idx + "/responses".length);
+  }
+
+  if (lower.startsWith("responses/")) {
+    return normalizedEndpoint.slice("responses".length);
+  }
+
+  return null;
 }
 
-function isCompactResponsesEndpoint(endpointPath: unknown): boolean {
+export function isCompactResponsesEndpoint(endpointPath: unknown): boolean {
   return getResponsesSubpath(endpointPath)?.toLowerCase() === "/compact";
 }
 
@@ -554,6 +569,7 @@ function clampEffort(model: string, requested: string): string {
 function normalizeEffortValue(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim().toLowerCase();
+  if (normalized === "max") return "xhigh";
   return normalized || undefined;
 }
 
@@ -662,6 +678,7 @@ export function encodeResponseSseEvent(raw: string): { sse: string; terminal: bo
       terminal = eventType === "response.completed" || eventType === "response.failed";
     }
   } catch {
+    console.warn("[codex] SSE payload parse failed, using raw payload");
     // Keep message as the generic SSE event for non-JSON upstream payloads.
   }
 
@@ -706,21 +723,40 @@ export class CodexExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
-    if (!isCodexResponsesWebSocketRequired(input.model, input.credentials)) {
-      return super.execute(input);
+    const sessionId = this.getPromptCacheSessionId(
+      input.credentials,
+      input.body as Record<string, unknown> | null
+    );
+    const identity = createCodexClientIdentity(
+      sessionId,
+      input.credentials?.providerSpecificData ?? null
+    );
+    const credentials = identity
+      ? {
+          ...input.credentials,
+          providerSpecificData: {
+            ...(input.credentials?.providerSpecificData || {}),
+            codexClientIdentity: identity,
+          },
+        }
+      : input.credentials;
+    const nextInput = { ...input, credentials };
+
+    if (!isCodexResponsesWebSocketRequired(nextInput.model, nextInput.credentials)) {
+      return super.execute(nextInput);
     }
 
     const url = CODEX_RESPONSES_WS_URL;
-    const headers = normalizeCodexWsHeaders(this.buildHeaders(input.credentials, true));
-    mergeUpstreamExtraHeaders(headers, input.upstreamExtraHeaders);
+    const headers = normalizeCodexWsHeaders(this.buildHeaders(nextInput.credentials, true));
+    mergeUpstreamExtraHeaders(headers, nextInput.upstreamExtraHeaders);
 
     const transformedBody = (await this.transformRequest(
-      input.model,
-      input.body,
+      nextInput.model,
+      nextInput.body,
       true,
-      input.credentials
+      nextInput.credentials
     )) as Record<string, unknown>;
-    transformedBody.model = getCodexUpstreamModel(transformedBody.model || input.model);
+    transformedBody.model = getCodexUpstreamModel(transformedBody.model || nextInput.model);
     delete transformedBody.stream;
     delete transformedBody.stream_options;
 
@@ -748,6 +784,7 @@ export class CodexExecutor extends BaseExecutor {
       try {
         ws?.close(1000, reason);
       } catch {
+        console.warn("[codex] closeUpstream: socket close race ignored");
         // ignore close races
       }
     };
@@ -755,7 +792,7 @@ export class CodexExecutor extends BaseExecutor {
     let abortHandler: (() => void) | null = null;
     const removeAbortListener = () => {
       if (!abortHandler) return;
-      input.signal?.removeEventListener("abort", abortHandler);
+      nextInput.signal?.removeEventListener("abort", abortHandler);
       abortHandler = null;
     };
 
@@ -781,12 +818,14 @@ export class CodexExecutor extends BaseExecutor {
         try {
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         } catch {
+          console.warn("[codex] finishStream: failed to enqueue [DONE]");
           // The downstream may already have gone away.
         }
       }
       try {
         controller.close();
       } catch {
+        console.warn("[codex] finishStream: failed to close controller");
         // The controller may already be closed.
       }
     };
@@ -816,7 +855,7 @@ export class CodexExecutor extends BaseExecutor {
         abortHandler = () => {
           finishStream({ reason: "client_aborted" });
         };
-        input.signal?.addEventListener("abort", abortHandler, { once: true });
+        nextInput.signal?.addEventListener("abort", abortHandler, { once: true });
 
         try {
           ws = await websocketFn(toWebSocketUrl(url), {
@@ -825,7 +864,7 @@ export class CodexExecutor extends BaseExecutor {
             headers,
           });
           if (closed) return;
-          if (input.signal?.aborted) {
+          if (nextInput.signal?.aborted) {
             finishStream({ reason: "client_aborted" });
             return;
           }
@@ -890,7 +929,12 @@ export class CodexExecutor extends BaseExecutor {
     };
   }
 
-  buildUrl(model, stream, urlIndex = 0, credentials = null) {
+  buildUrl(
+    model: string,
+    stream: boolean,
+    urlIndex = 0,
+    credentials: ProviderCredentials | null = null
+  ) {
     void model;
     void stream;
     void urlIndex;
@@ -912,7 +956,7 @@ export class CodexExecutor extends BaseExecutor {
    * Always request event-stream from upstream, even when client requested stream=false.
    * Includes chatgpt-account-id header for strict workspace binding.
    */
-  buildHeaders(credentials, stream = true) {
+  buildHeaders(credentials: ProviderCredentials, stream = true) {
     const isCompactRequest = isCompactResponsesEndpoint(credentials?.requestEndpointPath);
     const headers = super.buildHeaders(credentials, isCompactRequest ? false : true);
     headers.Version = getCodexClientVersion();
@@ -920,9 +964,13 @@ export class CodexExecutor extends BaseExecutor {
 
     // Add workspace binding header if workspaceId is persisted
     const workspaceId = credentials?.providerSpecificData?.workspaceId;
-    if (workspaceId) {
+    if (typeof workspaceId === "string" && workspaceId) {
       headers["chatgpt-account-id"] = workspaceId;
     }
+    const clientIdentity = credentials?.providerSpecificData?.codexClientIdentity as
+      | CodexClientIdentity
+      | null
+      | undefined;
 
     // Originator header — identifies the client type to the Codex backend.
     // Ref: openai/codex login/src/auth/default_client.rs DEFAULT_ORIGINATOR = "codex_cli_rs"
@@ -935,6 +983,7 @@ export class CodexExecutor extends BaseExecutor {
     if (cacheSessionId) {
       headers["session_id"] = cacheSessionId;
     }
+    applyCodexClientIdentityHeaders(headers, clientIdentity);
 
     return headers;
   }
@@ -948,16 +997,20 @@ export class CodexExecutor extends BaseExecutor {
    * Ref: openai/codex core/src/client.rs line 853
    */
   private getPromptCacheSessionId(
-    credentials,
+    credentials: ProviderCredentials | null | undefined,
     body: Record<string, unknown> | null
   ): string | null {
+    const promptCacheKey = normalizeCodexSessionId(body?.prompt_cache_key);
+    if (promptCacheKey) return promptCacheKey;
+
     // Prefer per-session identifiers from the client request body
     const sessionId = body?.session_id ?? body?.conversation_id;
-    if (typeof sessionId === "string" && sessionId.length > 0) {
-      return sessionId;
+    const normalizedSessionId = normalizeCodexSessionId(sessionId);
+    if (normalizedSessionId) {
+      return normalizedSessionId;
     }
     // Fall back to workspaceId (account-wide) — better than nothing
-    return credentials?.providerSpecificData?.workspaceId || null;
+    return normalizeCodexSessionId(credentials?.providerSpecificData?.workspaceId) || null;
   }
 
   /**
@@ -969,17 +1022,27 @@ export class CodexExecutor extends BaseExecutor {
    * have expired or become invalid. chatCore.ts calls this on 401; previously the
    * base class returned null causing the request to fail instead of refreshing.
    */
-  async refreshCredentials(credentials, log) {
+  async refreshCredentials(credentials: ProviderCredentials, log?: ExecutorLog | null) {
     if (!credentials?.refreshToken) {
       log?.warn?.("TOKEN_REFRESH", "Codex: no refresh token available, re-authentication required");
       return null;
     }
     const result = await getAccessToken("codex", credentials, log);
-    if (!result || result.error) {
+    if (!result) {
+      log?.warn?.("TOKEN_REFRESH", "Codex: token refresh failed — re-authentication required");
+      return null;
+    }
+    if (result.error) {
       log?.warn?.(
         "TOKEN_REFRESH",
-        `Codex: token refresh failed${result?.error ? ` (${result.error})` : ""} — re-authentication required`
+        `Codex: token refresh failed (${result.error}) — re-authentication required`
       );
+      // Return null (not the error-only object): base.ts spreads any truthy
+      // result onto activeCredentials and persists it via onCredentialsRefreshed.
+      // Spreading `{ error }` would keep the stale/expired accessToken in place
+      // and write garbage to the connection. Returning null leaves the original
+      // credentials untouched so the upstream 401/403 drives the proper
+      // re-auth / mark-expired path instead.
       return null;
     }
     return result;
@@ -988,11 +1051,19 @@ export class CodexExecutor extends BaseExecutor {
   /**
    * Transform request before sending - inject default instructions if missing
    */
-  transformRequest(model, body, stream, credentials) {
+  transformRequest(
+    model: string,
+    bodyInput: unknown,
+    stream: boolean,
+    credentials: ProviderCredentials
+  ) {
+    void stream;
     // Do not mutate the caller's payload in place. Combo quality checks and
     // other post-execute paths still inspect the original request body.
-    body =
-      body && typeof body === "object" ? structuredClone(body) : ({} as Record<string, unknown>);
+    const body: Record<string, unknown> =
+      bodyInput && typeof bodyInput === "object"
+        ? structuredClone(bodyInput as Record<string, unknown>)
+        : {};
 
     const nativeCodexPassthrough = body?._nativeCodexPassthrough === true;
     const isCompactRequest = isCompactResponsesEndpoint(credentials?.requestEndpointPath);
@@ -1005,6 +1076,7 @@ export class CodexExecutor extends BaseExecutor {
     if (isCompactRequest) {
       delete body.stream;
       delete body.stream_options;
+      delete body.client_metadata;
     } else {
       body.stream = true;
     }
@@ -1015,6 +1087,54 @@ export class CodexExecutor extends BaseExecutor {
       body.service_tier = requestServiceTier;
     } else if (requestDefaults.serviceTier) {
       body.service_tier = requestDefaults.serviceTier;
+    }
+
+    // Issue #1832 & #1853: Map messages to input for clients like Cursor 5.5 that use responses/compact but send messages instead of input.
+    // This MUST run before convertSystemToDeveloperRole and stripStoredItemReferences.
+    if (!body.input && Array.isArray(body.messages)) {
+      body.input = body.messages.map((msg: ResponsesMessageInput) => ({
+        type: "message",
+        role: typeof msg.role === "string" ? msg.role : "user",
+        ...(typeof msg.phase === "string" ? { phase: msg.phase } : {}),
+        content:
+          typeof msg.content === "string"
+            ? [{ type: "input_text", text: msg.content }]
+            : Array.isArray(msg.content)
+              ? msg.content.map((contentPart: unknown) => {
+                  if (
+                    contentPart &&
+                    typeof contentPart === "object" &&
+                    !Array.isArray(contentPart) &&
+                    (contentPart as Record<string, unknown>).type === "text"
+                  ) {
+                    return {
+                      type: "input_text",
+                      text: (contentPart as Record<string, unknown>).text,
+                    };
+                  }
+                  return contentPart;
+                })
+              : [],
+      }));
+    } else if (!body.input && typeof body.prompt === "string" && body.prompt.trim()) {
+      // Issue #1872: Cursor occasionally passes the request as `prompt` instead of `messages`.
+      body.input = [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: body.prompt }],
+        },
+      ];
+    } else if (!body.input && Array.isArray(body.prompt)) {
+      body.input = body.prompt.map((p: unknown) => ({
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: typeof p === "string" ? p : JSON.stringify(p) }],
+      }));
+    }
+
+    if (Array.isArray(body.input)) {
+      body.input = sanitizeResponsesInputItems(body.input, false);
     }
 
     // ── Cache-aware system prompt handling (both paths) ──
@@ -1056,9 +1176,10 @@ export class CodexExecutor extends BaseExecutor {
       }
     }
 
-    // Store: The Codex OAuth backend rejects store=true with
-    // "Store must be set to false". Default to false unless the provider
-    // explicitly opts in (e.g. API-key accounts that support persistence).
+    // Store: regular Codex Responses rejects store=true with
+    // "Store must be set to false", while /responses/compact rejects the
+    // store field entirely. Default regular requests to false unless the
+    // provider explicitly opts in (e.g. API-key accounts that support persistence).
     // Ref: sub2api openai_codex_transform.go line 75-80
     const explicitStoreSetting =
       credentials?.providerSpecificData &&
@@ -1066,7 +1187,9 @@ export class CodexExecutor extends BaseExecutor {
       !Array.isArray(credentials.providerSpecificData)
         ? credentials.providerSpecificData.openaiStoreEnabled
         : undefined;
-    if (explicitStoreSetting === true) {
+    if (isCompactRequest) {
+      delete body.store;
+    } else if (explicitStoreSetting === true) {
       body.store = true;
     } else {
       // backend rejects store=true ("Store must be set to false"), so default to false.
@@ -1094,40 +1217,42 @@ export class CodexExecutor extends BaseExecutor {
     if (splitModel.effort) {
       modelEffort = splitModel.effort;
       body.model = splitModel.baseModel;
-      cleanModel = body.model;
+      cleanModel = splitModel.baseModel;
     }
 
-    const explicitReasoning = normalizeEffortValue(body?.reasoning?.effort);
+    const reasoningRecord =
+      body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning)
+        ? (body.reasoning as Record<string, unknown>)
+        : null;
+    const explicitReasoning = normalizeEffortValue(reasoningRecord?.effort);
     const requestReasoningEffort = normalizeEffortValue(body.reasoning_effort);
     const fallbackReasoningEffort = allowConnectionReasoningDefaults
       ? requestDefaults.reasoningEffort || "medium"
       : undefined;
+    // Issue #2331: model suffix aliases (for example gpt-5.5-xhigh) represent an
+    // explicit model selection, so they must override client-injected defaults such
+    // as OpenCode's automatic reasoning.effort=medium for GPT-5-family requests.
     const rawEffort =
-      explicitReasoning || requestReasoningEffort || modelEffort || fallbackReasoningEffort;
+      modelEffort || explicitReasoning || requestReasoningEffort || fallbackReasoningEffort;
 
-    if (explicitReasoning) {
+    if (rawEffort) {
       body.reasoning = {
-        ...(body.reasoning && typeof body.reasoning === "object" ? body.reasoning : {}),
-        effort: clampEffort(cleanModel, explicitReasoning),
-      };
-    } else if (rawEffort) {
-      body.reasoning = {
-        ...(body.reasoning && typeof body.reasoning === "object" ? body.reasoning : {}),
+        ...(reasoningRecord || {}),
         effort: clampEffort(cleanModel, rawEffort),
       };
     }
     delete body.reasoning_effort;
-
-    // previous_response_id: always stripped by stripStoredItemReferences().
-    // The /codex/responses endpoint does not persist responses, so any reference
-    // to a previous response ID would cause a 404. This matches the behavior of
-    // both the official Codex CLI (sets None) and CLIProxyAPI (deletes the field).
 
     // Remove unsupported token limit parameters BEFORE the passthrough return.
     // Codex API rejects both max_tokens and max_output_tokens regardless of
     // whether the request came via native passthrough or translation.
     delete body.max_tokens;
     delete body.max_output_tokens;
+    // VS Code Copilot BYOK Responses requests include `truncation` (for example
+    // "auto" or "disabled"). The Codex /responses backend currently rejects this
+    // field entirely with 400 Unsupported parameter: truncation, so strip it for
+    // both native passthrough and translated requests.
+    delete body.truncation;
     delete body.background; // Droid CLI sends this but Codex Responses API rejects it
 
     // Inject prompt_cache_key for Codex prompt caching.
@@ -1141,6 +1266,15 @@ export class CodexExecutor extends BaseExecutor {
         body.prompt_cache_key = cacheSessionId;
       }
     }
+    if (!isCompactRequest) {
+      applyCodexClientMetadata(
+        body,
+        credentials?.providerSpecificData?.codexClientIdentity as
+          | CodexClientIdentity
+          | null
+          | undefined
+      );
+    }
 
     // Delete session_id and conversation_id from the body.
     // These are often injected by OmniRoute's fallback logic for store=true,
@@ -1152,21 +1286,35 @@ export class CodexExecutor extends BaseExecutor {
       return body;
     }
 
-    // Remove unsupported parameters for Codex API
-    delete body.temperature;
-    delete body.top_p;
-    delete body.frequency_penalty;
-    delete body.presence_penalty;
-    delete body.logprobs;
-    delete body.top_logprobs;
-    delete body.n;
-    delete body.seed;
-    // max_tokens and max_output_tokens already deleted above (before passthrough return)
-    delete body.user; // Cursor sends this but Codex doesn't support it
-    delete body.prompt_cache_retention; // Cursor sends this but Codex doesn't support it
-    delete body.metadata; // Cursor sends this but Codex doesn't support it
-    delete body.stream_options; // Cursor sends this but Codex doesn't support it
-    delete body.safety_identifier; // Droid CLI sends this but Codex doesn't support it
+    // Issue #2608: Use an allowlist of known Responses API fields instead of a
+    // denylist of Chat Completions fields. The denylist approach missed fields
+    // like `stop`, `response_format`, `logit_bias`, `function_call`, `functions`,
+    // `max_completion_tokens`, and `parallel_tool_calls` — causing gpt-5.5 to
+    // reject with "routing_unsupported" (400). An allowlist is future-proof:
+    // any unknown field from Chat Completions (or other formats) is stripped.
+    const RESPONSES_API_ALLOWLIST = new Set([
+      "model",
+      "input",
+      "instructions",
+      "tools",
+      "tool_choice",
+      "stream",
+      "store",
+      "reasoning",
+      "service_tier",
+      "include",
+      "previous_response_id",
+      "prompt_cache_key",
+      "client_metadata",
+      // Internal markers used by OmniRoute pipeline
+      "_omnirouteResponsesStore",
+    ]);
+
+    for (const key of Object.keys(body)) {
+      if (!RESPONSES_API_ALLOWLIST.has(key)) {
+        delete body[key];
+      }
+    }
 
     return body;
   }

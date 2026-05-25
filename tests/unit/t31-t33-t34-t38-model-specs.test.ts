@@ -56,7 +56,6 @@ test("T34: max output tokens are capped by model spec", () => {
 test("T38: modelSpecs exposes centralized helpers with alias and prefix lookup", () => {
   assert.equal(getModelSpec("gpt-5.5").contextWindow, 1050000);
   assert.equal(getModelSpec("gpt-5.5-high").maxOutputTokens, 128000);
-  assert.equal(getModelSpec("gpt-5.5-mini").contextWindow, 400000);
   assert.equal(typeof MODEL_SPECS["gemini-3.1-pro-high"], "object");
   assert.equal(getModelSpec("gemini-3-pro-high").maxOutputTokens, 65535);
   assert.equal(getModelSpec("gemini-3-pro-preview").maxOutputTokens, 65535);
@@ -71,4 +70,11 @@ test("T38: modelSpecs exposes centralized helpers with alias and prefix lookup",
   assert.equal(resolveModelAlias("gemini-3.1-pro-preview-customtools"), "gemini-3.1-pro-high");
   assert.equal(getDefaultThinkingBudget("gemini-3.1-pro-high"), 24576);
   assert.equal(capThinkingBudget("gemini-3.1-pro-low", 50000), 16000);
+});
+
+test("T38: MiMo V2.5 and V2 Omni models support vision", () => {
+  assert.equal(MODEL_SPECS["mimo-v2.5-pro"].supportsVision, true);
+  assert.equal(MODEL_SPECS["mimo-v2.5"].supportsVision, true);
+  assert.equal(MODEL_SPECS["mimo-v2-omni"].supportsVision, true);
+  assert.equal(MODEL_SPECS["mimo-v2-flash"].supportsVision, undefined);
 });

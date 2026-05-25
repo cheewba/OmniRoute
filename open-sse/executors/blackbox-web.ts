@@ -8,9 +8,59 @@ import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { normalizeSessionCookieHeader } from "@/lib/providers/webCookieAuth";
 
 const BLACKBOX_CHAT_API = "https://app.blackbox.ai/api/chat";
-const BLACKBOX_DEFAULT_COOKIE = "__Secure-authjs.session-token";
+const BLACKBOX_DEFAULT_COOKIE = "next-auth.session-token";
 const BLACKBOX_USER_AGENT =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+
+const SESSION_CACHE_TTL_MS = 5 * 60_000; // 5 minutes
+
+/**
+ * Resolve the `validated` token for Blackbox `/api/chat` requests.
+ *
+ * Blackbox's web frontend ships a real validation token (exported as `tk` from
+ * its Next.js JavaScript chunks). If the value sent in `transformedBody.validated`
+ * does not match that token, the upstream returns HTTP 403 even when the session
+ * cookie and subscription are valid — see issue #2252.
+ *
+ * Resolution priority:
+ *   1. `BLACKBOX_WEB_VALIDATED_TOKEN` env var (operator-supplied, preferred)
+ *   2. Random UUID fallback (the original behavior; works only as long as
+ *      Blackbox doesn't enforce a specific frontend `tk` value)
+ *
+ * We do NOT scrape Blackbox's Next.js chunks at runtime to extract `tk` — that
+ * coupling to their bundle hash is fragile and would silently break on every
+ * frontend deploy. The env-var override gives operators who have figured out
+ * the token a stable way to use it without patching code.
+ */
+export function resolveBlackboxValidatedToken(): string {
+  const explicit = (process.env.BLACKBOX_WEB_VALIDATED_TOKEN || "").trim();
+  if (explicit) return explicit;
+  return crypto.randomUUID();
+}
+
+/**
+ * Detect whether a Blackbox 403 response body indicates that the `validated`
+ * token is the problem (as opposed to a missing cookie or expired subscription).
+ * Surfaces the BLACKBOX_WEB_VALIDATED_TOKEN env var as the next step.
+ */
+function isBlackboxValidatedTokenError(responseText: string): boolean {
+  const lower = (responseText || "").toLowerCase();
+  return (
+    lower.includes("invalid validated token") ||
+    lower.includes("invalid validated") ||
+    lower.includes("validation token") ||
+    lower.includes("invalid token")
+  );
+}
+
+type CachedSession = {
+  sessionData: Record<string, unknown> | null;
+  subscriptionCache: Record<string, unknown> | null;
+  teamAccount: string;
+  fetchedAt: number;
+};
+
+const sessionCache = new Map<string, CachedSession>();
 
 type BlackboxMessage = {
   id: string;
@@ -290,13 +340,86 @@ export class BlackboxWebExecutor extends BaseExecutor {
     }
 
     const cookieHeader = normalizeBlackboxCookieHeader(credentials.apiKey || "");
-    const headers: Record<string, string> = {
-      Accept: "text/plain, */*",
-      "Content-Type": "application/json",
+    const baseHeaders: Record<string, string> = {
+      Accept: "application/json",
       Cookie: cookieHeader,
       Origin: "https://app.blackbox.ai",
-      Referer: `https://app.blackbox.ai/chat/${chatId}`,
       "User-Agent": BLACKBOX_USER_AGENT,
+    };
+
+    // Fetch session + subscription — Blackbox requires these in the request body.
+    // Cached per cookie to avoid redundant round-trips on every request.
+    let sessionData: Record<string, unknown> | null = null;
+    let subscriptionCache: Record<string, unknown> | null = null;
+    let teamAccount = "";
+
+    const cacheKey = cookieHeader;
+    const cached = sessionCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < SESSION_CACHE_TTL_MS) {
+      sessionData = cached.sessionData;
+      subscriptionCache = cached.subscriptionCache;
+      teamAccount = cached.teamAccount;
+      log?.debug?.("BLACKBOX-WEB", `Session cache hit (${teamAccount || "no email"})`);
+    } else {
+      const sideSignal = signal
+        ? mergeAbortSignals(signal, AbortSignal.timeout(10_000))
+        : AbortSignal.timeout(10_000);
+
+      try {
+        const sessionRes = await fetch("https://app.blackbox.ai/api/auth/session", {
+          method: "GET",
+          headers: { ...baseHeaders, Accept: "application/json" },
+          signal: sideSignal,
+        });
+        sessionData = sessionRes.ok ? ((await sessionRes.json()) as Record<string, unknown>) : null;
+        const email = (sessionData as any)?.user?.email as string | undefined;
+        teamAccount = email || "";
+        log?.debug?.("BLACKBOX-WEB", `Session email: ${email ?? "none"}`);
+
+        if (email) {
+          const subRes = await fetch("https://app.blackbox.ai/api/check-subscription", {
+            method: "POST",
+            headers: { ...baseHeaders, "Content-Type": "application/json" },
+            body: JSON.stringify({ email }),
+            signal: sideSignal,
+          });
+          const rawSub = subRes.ok ? ((await subRes.json()) as Record<string, unknown>) : null;
+          if (rawSub) {
+            subscriptionCache = {
+              status: rawSub.hasActiveSubscription ? "PREMIUM" : "FREE",
+              customerId: rawSub.customerId ?? null,
+              expiryTimestamp: rawSub.expiryTimestamp ?? null,
+              lastChecked: Date.now(),
+              isTrialSubscription: rawSub.isTrialSubscription ?? false,
+              hasPaymentVerificationFailure: false,
+              verificationFailureTimestamp: null,
+              requiresAuthentication: false,
+              isTeam: rawSub.isTeam ?? false,
+              numSeats: rawSub.numSeats ?? 1,
+              provider: rawSub.provider ?? null,
+              previouslySubscribed: rawSub.previouslySubscribed ?? false,
+              activeInsuffientCredits: rawSub.activeInsuffientCredits ?? false,
+            };
+            log?.debug?.("BLACKBOX-WEB", `Subscription: ${subscriptionCache.status}`);
+          }
+        }
+
+        sessionCache.set(cacheKey, {
+          sessionData,
+          subscriptionCache,
+          teamAccount,
+          fetchedAt: Date.now(),
+        });
+      } catch (diagErr) {
+        log?.debug?.("BLACKBOX-WEB", `Session/subscription fetch failed (non-fatal): ${diagErr}`);
+      }
+    }
+
+    const headers: Record<string, string> = {
+      ...baseHeaders,
+      Accept: "text/plain, */*",
+      "Content-Type": "application/json",
+      Referer: `https://app.blackbox.ai/chat/${chatId}`,
     };
     mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
 
@@ -322,7 +445,9 @@ export class BlackboxWebExecutor extends BaseExecutor {
       mobileClient: false,
       userSelectedModel: model || null,
       userSelectedAgent: "VscodeAgent",
-      validated: crypto.randomUUID(),
+      // Issue #2252: prefer operator-supplied BLACKBOX_WEB_VALIDATED_TOKEN over
+      // a random UUID — Blackbox's `/api/chat` rejects mismatched tokens with 403.
+      validated: resolveBlackboxValidatedToken(),
       imageGenerationMode: false,
       imageGenMode: "autoMode",
       webSearchModePrompt: false,
@@ -343,10 +468,12 @@ export class BlackboxWebExecutor extends BaseExecutor {
         webMode: false,
         offlineMode: false,
       },
-      session: null,
-      isPremium: credentials.providerSpecificData?.isPremium ?? true,
-      teamAccount: "",
-      subscriptionCache: null,
+      session: sessionData,
+      isPremium: subscriptionCache
+        ? subscriptionCache.status === "PREMIUM"
+        : (credentials.providerSpecificData?.isPremium ?? true),
+      teamAccount,
+      subscriptionCache,
       beastMode: false,
       reasoningMode: false,
       designerMode: false,
@@ -391,7 +518,15 @@ export class BlackboxWebExecutor extends BaseExecutor {
     if (!upstreamResponse.ok) {
       const status = upstreamResponse.status;
       let message = `Blackbox Web returned HTTP ${status}`;
-      if (status === 401 || status === 403) {
+      // Issue #2252: distinguish "wrong validated token" from "expired cookie"
+      // when 403 carries a token-specific body — the fix is different in each case.
+      const errorBody = await upstreamResponse.text().catch(() => "");
+      if (status === 403 && isBlackboxValidatedTokenError(errorBody)) {
+        message =
+          "Blackbox Web rejected the request with an invalid `validated` token. " +
+          "If you have a valid frontend token (the `tk` value from app.blackbox.ai's " +
+          "Next.js bundle), set BLACKBOX_WEB_VALIDATED_TOKEN in your environment and restart.";
+      } else if (status === 401 || status === 403) {
         message =
           "Blackbox Web auth failed — your app.blackbox.ai session cookie may be missing or expired.";
       } else if (status === 429) {
@@ -434,6 +569,70 @@ export class BlackboxWebExecutor extends BaseExecutor {
     }
 
     const responseText = (await readTextResponse(upstreamResponse.body, signal)).trim();
+
+    log?.debug?.("BLACKBOX-WEB", `Response (first 300 chars): ${responseText.slice(0, 300)}`);
+    log?.debug?.("BLACKBOX-WEB", `userSelectedModel sent: ${transformedBody.userSelectedModel}`);
+    log?.debug?.("BLACKBOX-WEB", `isPremium sent: ${transformedBody.isPremium}`);
+
+    // Blackbox sometimes returns HTTP 200 with in-band error messages instead of proper HTTP status codes.
+    // Detect known error patterns and surface them as real errors.
+    const lowerText = responseText.toLowerCase();
+    const isSubscriptionError =
+      /not upgraded|upgrade to a premium plan|upgrade.required/i.test(responseText) ||
+      lowerText.includes("please upgrade");
+    const isAuthError =
+      /please login|login required|authentication required/i.test(responseText) &&
+      !isSubscriptionError;
+    const isRateLimit = /rate limit|too many requests/i.test(responseText) && !isSubscriptionError;
+
+    if (isSubscriptionError) {
+      log?.warn?.("BLACKBOX-WEB", "Blackbox returned subscription error in response body");
+      const errorResponse = new Response(
+        JSON.stringify({
+          error: {
+            message:
+              "Blackbox reports your account lacks a premium subscription. " +
+              "If you have a paid plan, re-paste your session cookie from app.blackbox.ai.",
+            type: "upstream_error",
+            code: "BLACKBOX_SUBSCRIPTION_REQUIRED",
+          },
+        }),
+        { status: 402, headers: { "Content-Type": "application/json" } }
+      );
+      return { response: errorResponse, url: BLACKBOX_CHAT_API, headers, transformedBody };
+    }
+
+    if (isAuthError) {
+      log?.warn?.("BLACKBOX-WEB", "Blackbox returned auth error in response body");
+      const errorResponse = new Response(
+        JSON.stringify({
+          error: {
+            message:
+              "Blackbox session is not authenticated — re-paste next-auth.session-token from app.blackbox.ai",
+            type: "upstream_error",
+            code: "BLACKBOX_AUTH_REQUIRED",
+          },
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      );
+      return { response: errorResponse, url: BLACKBOX_CHAT_API, headers, transformedBody };
+    }
+
+    if (isRateLimit) {
+      log?.warn?.("BLACKBOX-WEB", "Blackbox returned rate-limit error in response body");
+      const errorResponse = new Response(
+        JSON.stringify({
+          error: {
+            message: "Blackbox Web rate limited the session. Wait a moment and retry.",
+            type: "upstream_error",
+            code: "BLACKBOX_RATE_LIMIT",
+          },
+        }),
+        { status: 429, headers: { "Content-Type": "application/json" } }
+      );
+      return { response: errorResponse, url: BLACKBOX_CHAT_API, headers, transformedBody };
+    }
+
     const id = `chatcmpl-blackbox-${crypto.randomUUID().slice(0, 12)}`;
     const created = Math.floor(Date.now() / 1000);
 

@@ -175,6 +175,7 @@ export const DEFAULT_PRICING = {
 
   // OpenAI Codex (cx)
   cx: {
+    "codex-auto-review": GPT_5_5_PRICING,
     // GPT 5.5
     "gpt-5.5": GPT_5_5_PRICING,
     "gpt5.5": GPT_5_5_PRICING,
@@ -349,7 +350,7 @@ export const DEFAULT_PRICING = {
       reasoning: 6.0,
       cache_creation: 1.0,
     },
-    // Next-generation Qwen Coder tier (added Mar 2026 from decolua/9router catalog)
+    // Next-generation Qwen Coder tier (added Mar 2026)
     "qwen3-coder-next": {
       input: 2.0,
       output: 8.0,
@@ -424,7 +425,7 @@ export const DEFAULT_PRICING = {
       reasoning: 2.19,
       cache_creation: 0.55,
     },
-    // Short-form aliases used by decolua/9router catalog (Mar 2026)
+    // Short-form aliases (Mar 2026)
     "deepseek-3.1": {
       input: 0.27,
       output: 1.1,
@@ -810,6 +811,21 @@ export const DEFAULT_PRICING = {
       cached: 0.14,
       reasoning: 2.19,
       cache_creation: 0.55,
+    },
+    // DeepSeek V4 Pro — promo until 2026-05-31, then list ($0.145 / $3.48)
+    "deepseek-v4-pro": {
+      input: 0.435,
+      output: 0.87,
+      cached: 0.0036,
+      reasoning: 0.87,
+      cache_creation: 0.435,
+    },
+    "deepseek-v4-flash": {
+      input: 0.07,
+      output: 0.28,
+      cached: 0.014,
+      reasoning: 0.28,
+      cache_creation: 0.07,
     },
   },
 
@@ -1355,15 +1371,7 @@ export function getDefaultPricing() {
   return DEFAULT_PRICING;
 }
 
-/**
- * Format cost for display
- * @param {number} cost - Cost in dollars
- * @returns {string} Formatted cost string
- */
-export function formatCost(cost: number | null | undefined): string {
-  if (cost === null || cost === undefined || isNaN(cost)) return "$0.00";
-  return `$${cost.toFixed(2)}`;
-}
+export { formatCost } from "../utils/formatting";
 
 /**
  * Calculate cost from tokens and pricing

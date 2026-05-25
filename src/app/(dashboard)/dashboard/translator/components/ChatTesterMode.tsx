@@ -7,9 +7,7 @@ import { Card, Button, Select, Badge } from "@/shared/components";
 import { FORMAT_META, FORMAT_OPTIONS } from "../exampleTemplates";
 import { useProviderOptions } from "../hooks/useProviderOptions";
 import { useAvailableModels } from "../hooks/useAvailableModels";
-import dynamic from "next/dynamic";
-
-const Editor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
+import Editor from "@/shared/components/MonacoEditor";
 
 /**
  * Chat Tester Mode:
@@ -79,6 +77,17 @@ export default function ChatTesterMode() {
             parts: [{ text: m.content }],
           })),
         };
+      } else if (clientFormat === "antigravity") {
+        clientRequest = {
+          request: {
+            contents: allMessages.map((m) => ({
+              role: m.role === "assistant" ? "model" : "user",
+              parts: [{ text: m.content }],
+            })),
+          },
+          model,
+          userAgent: "antigravity",
+        };
       } else if (clientFormat === "openai-responses") {
         clientRequest = {
           model,
@@ -87,6 +96,12 @@ export default function ChatTesterMode() {
             role: m.role,
             content: [{ type: "input_text", text: m.content }],
           })),
+          stream: true,
+        };
+      } else if (clientFormat === "cursor" || clientFormat === "kiro") {
+        clientRequest = {
+          model,
+          messages: allMessages,
           stream: true,
         };
       } else {
@@ -278,9 +293,7 @@ export default function ChatTesterMode() {
                   <Select
                     value={clientFormat}
                     onChange={(e) => setClientFormat(e.target.value)}
-                    options={FORMAT_OPTIONS.filter((o) =>
-                      ["openai", "claude", "gemini", "openai-responses"].includes(o.value)
-                    )}
+                    options={FORMAT_OPTIONS}
                   />
                 </div>
                 <div className="flex-1">
