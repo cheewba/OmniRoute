@@ -104,7 +104,6 @@ export function claudeToGeminiRequest(model, body, stream) {
             case "tool_use":
               parts.push({
                 functionCall: {
-                  id: block.id,
                   name: sanitizeToolName(block.name),
                   args: block.input || {},
                 },
@@ -126,7 +125,6 @@ export function claudeToGeminiRequest(model, body, stream) {
               }
               parts.push({
                 functionResponse: {
-                  id: block.tool_use_id,
                   name: toolUseNames[block.tool_use_id] || "unknown",
                   response: { result: parsedContent },
                 },

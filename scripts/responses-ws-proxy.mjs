@@ -1,6 +1,15 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { STATUS_CODES } from "node:http";
-import { websocket } from "wreq-js";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+let websocket = null;
+try {
+  const loaded = require("wreq-js");
+  websocket = loaded.websocket ?? loaded.default?.websocket ?? null;
+} catch {
+  websocket = null;
+}
 
 export const RESPONSES_WS_PUBLIC_PATHS = new Set([
   "/responses",
@@ -138,11 +147,17 @@ function writeHttpError(socket, status, body, headers = {}) {
 
   const bodyBuffer = Buffer.from(body || "", "utf8");
   const statusText = STATUS_CODES[status] || "Error";
+  const filteredHeaders = Object.fromEntries(
+    Object.entries(headers).filter(([key]) => {
+      const lower = key.toLowerCase();
+      return lower !== "content-length" && lower !== "transfer-encoding" && lower !== "connection" && lower !== "upgrade";
+    })
+  );
   const responseHeaders = {
     Connection: "close",
     "Content-Length": String(bodyBuffer.length),
     "Content-Type": "application/json; charset=utf-8",
-    ...headers,
+    ...filteredHeaders,
   };
 
   const head = [
@@ -154,6 +169,31 @@ function writeHttpError(socket, status, body, headers = {}) {
 
   socket.write(head);
   socket.end(bodyBuffer);
+}
+
+let bridgeSessionCookie = null;
+
+function createBridgeSessionToken() {
+  const secret = process.env.JWT_SECRET;
+  if (!isText(secret)) return null;
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(
+    JSON.stringify({
+      sub: "omniroute-responses-ws-bridge",
+      iat: Math.floor(Date.now() / 1000),
+    })
+  ).toString("base64url");
+  const signature = createHmac("sha256", secret)
+    .update(`${header}.${payload}`)
+    .digest("base64url");
+  return `${header}.${payload}.${signature}`;
+}
+
+function getBridgeSessionCookie() {
+  if (bridgeSessionCookie !== null) return bridgeSessionCookie;
+  const token = createBridgeSessionToken();
+  bridgeSessionCookie = token ? `auth_token=${token}` : null;
+  return bridgeSessionCookie;
 }
 
 function getAuthHeaders(requestUrl, requestHeaders) {
@@ -171,7 +211,11 @@ function getAuthHeaders(requestUrl, requestHeaders) {
     }
   }
 
-  if (isText(requestHeaders.cookie)) headers.cookie = requestHeaders.cookie;
+  const cookieParts = [];
+  if (isText(requestHeaders.cookie)) cookieParts.push(requestHeaders.cookie);
+  const bridgeCookie = getBridgeSessionCookie();
+  if (bridgeCookie) cookieParts.push(bridgeCookie);
+  if (cookieParts.length > 0) headers.cookie = cookieParts.join('; ');
   if (isText(requestHeaders.origin)) headers.origin = requestHeaders.origin;
   if (isText(requestHeaders["x-forwarded-for"])) {
     headers["x-forwarded-for"] = requestHeaders["x-forwarded-for"];

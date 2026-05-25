@@ -49,6 +49,8 @@ http.createServer = function createServerWithResponsesWs(...args) {
   const server = originalCreateServer(...args);
   const originalOn = server.on.bind(server);
   const originalAddListener = server.addListener.bind(server);
+  const originalPrependListener = server.prependListener.bind(server);
+  const originalOnce = server.once.bind(server);
 
   server.on = function patchedOn(eventName, listener) {
     if (eventName === "upgrade" && typeof listener === "function") {
@@ -62,6 +64,20 @@ http.createServer = function createServerWithResponsesWs(...args) {
       return originalAddListener(eventName, wrapUpgradeListener(server, listener));
     }
     return originalAddListener(eventName, listener);
+  };
+
+  server.prependListener = function patchedPrependListener(eventName, listener) {
+    if (eventName === "upgrade" && typeof listener === "function") {
+      return originalPrependListener(eventName, wrapUpgradeListener(server, listener));
+    }
+    return originalPrependListener(eventName, listener);
+  };
+
+  server.once = function patchedOnce(eventName, listener) {
+    if (eventName === "upgrade" && typeof listener === "function") {
+      return originalOnce(eventName, wrapUpgradeListener(server, listener));
+    }
+    return originalOnce(eventName, listener);
   };
 
   return server;

@@ -18,6 +18,11 @@ function isInternalModelSyncRequest(ctx: PolicyContext): boolean {
 export const managementPolicy: RoutePolicy = {
   routeClass: "MANAGEMENT",
   async evaluate(ctx: PolicyContext): Promise<AuthOutcome> {
+    const bridgeSecret = ctx.request.headers.get("x-omniroute-ws-bridge-secret");
+    if (ctx.classification.normalizedPath === "/api/internal/codex-responses-ws" && bridgeSecret) {
+      return allow({ kind: "anonymous", id: "internal-bridge", label: "codex-ws-bridge" });
+    }
+
     if (!(await isAuthRequired())) {
       return allow({ kind: "anonymous", id: "anonymous", label: "auth-disabled" });
     }

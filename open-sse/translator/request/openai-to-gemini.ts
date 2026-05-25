@@ -244,7 +244,6 @@ function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolName
             parts.push({
               ...(embeddedThoughtSignature ? { thoughtSignature: embeddedThoughtSignature } : {}),
               functionCall: {
-                id: tc.id,
                 name: sanitizeToolName(tc.function.name),
                 args: args,
               },
@@ -286,7 +285,6 @@ function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolName
 
               toolParts.push({
                 functionResponse: {
-                  id: fid,
                   name: name,
                   response: { result: parsedResp },
                 },
@@ -496,7 +494,6 @@ function wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials = nu
           } else if (block.type === "tool_use") {
             parts.push({
               functionCall: {
-                id: block.id,
                 name: sanitizeToolName(block.name),
                 args: block.input || {},
               },
@@ -510,7 +507,6 @@ function wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials = nu
             }
             parts.push({
               functionResponse: {
-                id: block.tool_use_id,
                 name: toolUseNames[block.tool_use_id] || "unknown",
                 response: { result: tryParseJSON(content) || content },
               },

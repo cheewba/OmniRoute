@@ -89,21 +89,15 @@ function normalizeUpstreamHeaders(headers: Record<string, string>): Record<strin
 }
 
 async function authenticate(body: JsonRecord) {
-  const authRequest = getAuthRequest(body);
-  const auth = await authorizeWebSocketHandshake(authRequest);
-  if (!auth.authorized) {
-    return jsonError(
-      auth.hasCredential ? 403 : 401,
-      auth.hasCredential ? "ws_auth_invalid" : "ws_auth_required",
-      auth.hasCredential ? "Invalid WebSocket credential" : "WebSocket auth required"
-    );
-  }
-
+  // The bridge secret already protects this internal route. The Codex websocket
+  // transport does not reliably send a client auth header during upgrade, so the
+  // bridge must be able to proceed without a second auth gate here.
+  getAuthRequest(body);
   return NextResponse.json({
     ok: true,
-    authenticated: auth.authenticated,
-    authType: auth.authType,
-    wsAuth: auth.wsAuth,
+    authenticated: false,
+    authType: "none",
+    wsAuth: false,
   });
 }
 

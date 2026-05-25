@@ -20,7 +20,8 @@ function isDashboardModelCatalogRead(ctx: PolicyContext): boolean {
   if (method !== "GET" && method !== "HEAD") return false;
   return (
     ctx.classification.normalizedPath === "/api/v1/models" ||
-    ctx.classification.normalizedPath === "/api/v1"
+    ctx.classification.normalizedPath === "/api/v1" ||
+    ctx.classification.normalizedPath === "/api/v1/search/analytics"
   );
 }
 

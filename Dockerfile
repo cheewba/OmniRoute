@@ -52,6 +52,8 @@ COPY --from=builder /app/src/lib/db/migrations ./migrations
 ENV OMNIROUTE_MIGRATIONS_DIR=/app/migrations
 
 COPY --from=builder /app/scripts/run-standalone.mjs ./run-standalone.mjs
+COPY --from=builder /app/scripts/standalone-server-ws.mjs ./standalone-server-ws.mjs
+COPY --from=builder /app/scripts/responses-ws-proxy.mjs ./responses-ws-proxy.mjs
 COPY --from=builder /app/scripts/runtime-env.mjs ./runtime-env.mjs
 COPY --from=builder /app/scripts/bootstrap-env.mjs ./bootstrap-env.mjs
 COPY --from=builder /app/scripts/healthcheck.mjs ./healthcheck.mjs
