@@ -3,6 +3,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button, Card, Modal } from "@/shared/components";
+import { useProxyBatchOperations } from "./useProxyBatchOperations";
+import { ProxyStatusBadge } from "./ProxyStatusBadge";
+import { ProxyHealthCell } from "./ProxyHealthCell";
+import { ProxyBatchActions } from "./ProxyBatchActions";
+import { ProxyCheckboxCell } from "./ProxyCheckboxCell";
 
 type ProxyItem = {
   id: string;
@@ -15,6 +20,7 @@ type ProxyItem = {
   region?: string | null;
   notes?: string | null;
   status?: string;
+  family?: string;
 };
 
 type UsageInfo = {
@@ -66,6 +72,7 @@ const EMPTY_FORM = {
   region: "",
   notes: "",
   status: "active",
+  family: "auto",
 };
 
 const BULK_IMPORT_TEMPLATE = `# Proxy Bulk Import
@@ -168,6 +175,20 @@ export default function ProxyRegistryManager() {
   const [bulkScopeIds, setBulkScopeIds] = useState("");
   const [bulkProxyId, setBulkProxyId] = useState("");
 
+  // Proxy pool / rotation state (#6365) — a single scope can hold MULTIPLE
+  // proxies and pick a rotation strategy that cycles egress IPs.
+  const [poolOpen, setPoolOpen] = useState(false);
+  const [poolScope, setPoolScope] = useState("provider");
+  const [poolScopeId, setPoolScopeId] = useState("");
+  const [poolStrategy, setPoolStrategy] = useState<"round-robin" | "random" | "sticky">(
+    "round-robin"
+  );
+  const [poolMembers, setPoolMembers] = useState<string[]>([]);
+  const [poolAddProxyId, setPoolAddProxyId] = useState("");
+  const [poolLoading, setPoolLoading] = useState(false);
+  const [poolSaving, setPoolSaving] = useState(false);
+  const [poolLoaded, setPoolLoaded] = useState(false);
+
   // Bulk Import state
   const [bulkImportOpen, setBulkImportOpen] = useState(false);
   const [bulkImportText, setBulkImportText] = useState(BULK_IMPORT_TEMPLATE);
@@ -245,13 +266,42 @@ export default function ProxyRegistryManager() {
       const ids = loaded.map((p) => p.id).filter(Boolean);
       void loadHealth();
       void loadAllUsage(ids);
-    } catch (e: any) {
-      setError(e?.message || t("errorLoadFailed"));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg || t("errorLoadFailed"));
       setItems([]);
     } finally {
       setLoading(false);
     }
   }, [loadHealth, loadAllUsage, t]);
+
+  // MUST stay after the `load` const — earlier use TDZ-crashes SSR (#5918 guard).
+  const {
+    selectedIds,
+    setSelectedIds,
+    batchDeleting,
+    autoTesting,
+    batchActivating,
+    toggleSelectAll: hookToggleSelectAll,
+    toggleSelect,
+    handleBatchDelete: hookHandleBatchDelete,
+    handleBatchActivate: hookHandleBatchActivate,
+    handleAutoTestAll: hookHandleAutoTestAll,
+  } = useProxyBatchOperations(load);
+
+  const allSelected = items.length > 0 && items.every((item) => selectedIds.has(item.id));
+
+  const handleBatchDelete = useCallback(() => {
+    hookHandleBatchDelete(setError);
+  }, [hookHandleBatchDelete, setError]);
+
+  const handleBatchActivate = useCallback(() => {
+    hookHandleBatchActivate(setError, "active");
+  }, [hookHandleBatchActivate, setError]);
+
+  const handleAutoTestAll = useCallback(() => {
+    hookHandleAutoTestAll(setError, setTestById);
+  }, [hookHandleAutoTestAll, setError, setTestById]);
 
   useEffect(() => {
     void load();
@@ -280,6 +330,7 @@ export default function ProxyRegistryManager() {
       region: item.region || "",
       notes: item.notes || "",
       status: item.status || "active",
+      family: item.family || "auto",
     });
     setModalOpen(true);
   };
@@ -366,6 +417,7 @@ export default function ProxyRegistryManager() {
       region: (form.region || "").trim() || null,
       notes: (form.notes || "").trim() || null,
       status: form.status,
+      family: form.family || "auto",
     };
     if (!editingId || normalizedUsername.length > 0) {
       payload.username = normalizedUsername;
@@ -492,6 +544,133 @@ export default function ProxyRegistryManager() {
     }
   };
 
+  // ── Proxy pool / rotation (#6365) ──
+  const poolQuery = useCallback(() => {
+    const params = new URLSearchParams({ scope: poolScope });
+    if (poolScope !== "global") params.set("scopeId", poolScopeId.trim());
+    return params.toString();
+  }, [poolScope, poolScopeId]);
+
+  const loadPool = useCallback(async () => {
+    if (poolScope !== "global" && !poolScopeId.trim()) {
+      setError(t("poolScopeIdRequired"));
+      return;
+    }
+    setPoolLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/settings/proxies/pool?${poolQuery()}`);
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(payload?.error?.message || t("poolLoadFailed"));
+        return;
+      }
+      const members: Array<{ proxyId: string }> = Array.isArray(payload?.members)
+        ? payload.members
+        : [];
+      setPoolMembers(members.map((m) => m.proxyId));
+      setPoolStrategy(
+        ["round-robin", "random", "sticky"].includes(payload?.strategy)
+          ? payload.strategy
+          : "round-robin"
+      );
+      setPoolLoaded(true);
+    } catch (e: any) {
+      setError(e?.message || t("poolLoadFailed"));
+    } finally {
+      setPoolLoading(false);
+    }
+  }, [poolScope, poolScopeId, poolQuery, t]);
+
+  const handlePoolAddMember = async () => {
+    if (!poolAddProxyId) return;
+    setPoolSaving(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/settings/proxies/pool", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scope: poolScope,
+          scopeId: poolScope === "global" ? null : poolScopeId.trim(),
+          proxyId: poolAddProxyId,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(payload?.error?.message || t("poolAddFailed"));
+        return;
+      }
+      setPoolAddProxyId("");
+      await loadPool();
+      await load();
+    } catch (e: any) {
+      setError(e?.message || t("poolAddFailed"));
+    } finally {
+      setPoolSaving(false);
+    }
+  };
+
+  const handlePoolRemoveMember = async (proxyId: string) => {
+    setPoolSaving(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/settings/proxies/pool", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scope: poolScope,
+          scopeId: poolScope === "global" ? null : poolScopeId.trim(),
+          proxyId,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(payload?.error?.message || t("poolRemoveFailed"));
+        return;
+      }
+      await loadPool();
+      await load();
+    } catch (e: any) {
+      setError(e?.message || t("poolRemoveFailed"));
+    } finally {
+      setPoolSaving(false);
+    }
+  };
+
+  const handlePoolStrategyChange = async (strategy: "round-robin" | "random" | "sticky") => {
+    const previous = poolStrategy;
+    setPoolStrategy(strategy);
+    setError(null);
+    try {
+      const res = await fetch("/api/settings/proxies/pool", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scope: poolScope,
+          scopeId: poolScope === "global" ? null : poolScopeId.trim(),
+          strategy,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPoolStrategy(previous);
+        setError(payload?.error?.message || t("poolStrategyFailed"));
+      }
+    } catch (e: any) {
+      setPoolStrategy(previous);
+      setError(e?.message || t("poolStrategyFailed"));
+    }
+  };
+
+  const openPool = () => {
+    setPoolMembers([]);
+    setPoolLoaded(false);
+    setPoolAddProxyId("");
+    setPoolStrategy("round-robin");
+    setPoolOpen(true);
+  };
+
   const handleBulkImportParse = () => {
     const { entries, errors, skipped } = parseBulkImportText(bulkImportText);
     setBulkImportParsed(entries);
@@ -602,6 +781,24 @@ export default function ProxyRegistryManager() {
             </Button>
             <Button
               size="sm"
+              variant="secondary"
+              icon="hub"
+              onClick={openPool}
+              data-testid="proxy-registry-open-pool"
+            >
+              {t("managePool")}
+            </Button>
+            <ProxyBatchActions
+              selectedCount={selectedIds.size}
+              batchDeleting={batchDeleting}
+              autoTesting={autoTesting}
+              batchActivating={batchActivating}
+              onBatchDelete={handleBatchDelete}
+              onBatchActivate={handleBatchActivate}
+              onAutoTestAll={handleAutoTestAll}
+            />
+            <Button
+              size="sm"
               icon="add"
               onClick={openCreate}
               data-testid="proxy-registry-open-create"
@@ -626,8 +823,21 @@ export default function ProxyRegistryManager() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-left text-text-muted border-b border-border">
+                  <th className="py-2 pr-2 w-8">
+                    <input
+                      type="checkbox"
+                      className="accent-blue-500 w-4 h-4 cursor-pointer"
+                      checked={allSelected}
+                      ref={(el) => {
+                        if (el)
+                          el.indeterminate =
+                            !allSelected && items.some((item) => selectedIds.has(item.id));
+                      }}
+                      onChange={() => hookToggleSelectAll(allSelected, items)}
+                      aria-label="Select all proxies"
+                    />
+                  </th>
                   <th className="py-2 pr-3">{t("tableName")}</th>
-                  <th className="py-2 pr-3">{t("tableEndpoint")}</th>
                   <th className="py-2 pr-3">{t("tableStatus")}</th>
                   <th className="py-2 pr-3">{t("tableHealth")}</th>
                   <th className="py-2 pr-3">{t("tableUsage")}</th>
@@ -640,6 +850,11 @@ export default function ProxyRegistryManager() {
                   const health = healthById[item.id];
                   return (
                     <tr key={item.id} className="border-b border-border/60">
+                      <ProxyCheckboxCell
+                        checked={selectedIds.has(item.id)}
+                        onChange={() => toggleSelect(item.id)}
+                        label={`Select ${item.name}`}
+                      />
                       <td className="py-2 pr-3">
                         <div className="font-medium text-text-main">{item.name}</div>
                         {item.region && (
@@ -650,38 +865,13 @@ export default function ProxyRegistryManager() {
                         {item.type}://{item.host}:{item.port}
                       </td>
                       <td className="py-2 pr-3">
-                        <span className="text-xs px-2 py-1 rounded border border-border bg-bg-subtle">
-                          {item.status === "inactive" ? t("statusInactive") : t("statusActive")}
-                        </span>
+                        <ProxyStatusBadge status={item.status} />
                       </td>
                       <td className="py-2 pr-3 text-xs text-text-muted">
-                        <div className="flex flex-col gap-0.5">
-                          {testById[item.id] ? (
-                            testById[item.id]!.success ? (
-                              <>
-                                <span className="text-emerald-400">
-                                  ✓ {testById[item.id]!.publicIp}
-                                </span>
-                                {testById[item.id]!.latencyMs && (
-                                  <span>{testById[item.id]!.latencyMs}ms</span>
-                                )}
-                              </>
-                            ) : (
-                              <span className="text-red-400">
-                                ✗ {testById[item.id]!.error || t("failed")}
-                              </span>
-                            )
-                          ) : health ? (
-                            <>
-                              <span>{t("successRate", { rate: health.successRate ?? 0 })}</span>
-                              <span>
-                                {t("avgLatency", { latency: health.avgLatencyMs ?? "-" })}
-                              </span>
-                            </>
-                          ) : (
-                            <span>—</span>
-                          )}
-                        </div>
+                        <ProxyHealthCell
+                          testResult={testById[item.id] ?? undefined}
+                          health={health ?? undefined}
+                        />
                       </td>
                       <td className="py-2 pr-3 text-xs text-text-muted">
                         {usageById[item.id] != null
@@ -765,6 +955,19 @@ export default function ProxyRegistryManager() {
                 <option value="https">HTTPS</option>
                 <option value="socks5">SOCKS5</option>
               </select>
+            </div>
+            <div>
+              <label className="text-xs text-text-muted mb-1 block">{t("labelFamily")}</label>
+              <select
+                className="w-full px-3 py-2 rounded bg-bg-subtle border border-border"
+                value={form.family}
+                onChange={(e) => setForm((prev) => ({ ...prev, family: e.target.value }))}
+              >
+                <option value="auto">{t("familyAuto")}</option>
+                <option value="ipv4">{t("familyIpv4")}</option>
+                <option value="ipv6">{t("familyIpv6")}</option>
+              </select>
+              <p className="text-[11px] text-text-muted mt-1">{t("familyHint")}</p>
             </div>
             <div>
               <label className="text-xs text-text-muted mb-1 block">{t("labelHost")}</label>
@@ -910,6 +1113,170 @@ export default function ProxyRegistryManager() {
               data-testid="proxy-registry-bulk-apply"
             >
               {t("bulkApply")}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Proxy Pool / Rotation Modal (#6365) */}
+      <Modal
+        isOpen={poolOpen}
+        onClose={() => {
+          if (!poolSaving && !poolLoading) setPoolOpen(false);
+        }}
+        title={t("poolTitle")}
+        maxWidth="lg"
+      >
+        <div className="flex flex-col gap-3">
+          <p className="text-sm text-text-muted">{t("poolDescription")}</p>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-text-muted mb-1 block">{t("labelScope")}</label>
+              <select
+                className="w-full px-3 py-2 rounded bg-bg-subtle border border-border"
+                value={poolScope}
+                onChange={(e) => {
+                  setPoolScope(e.target.value);
+                  setPoolLoaded(false);
+                  setPoolMembers([]);
+                }}
+                data-testid="proxy-registry-pool-scope"
+              >
+                <option value="global">{t("scopeGlobal")}</option>
+                <option value="provider">{t("scopeProvider")}</option>
+                <option value="account">{t("scopeAccount")}</option>
+                <option value="combo">{t("scopeCombo")}</option>
+              </select>
+            </div>
+            {poolScope !== "global" && (
+              <div>
+                <label className="text-xs text-text-muted mb-1 block">
+                  {t("poolScopeIdLabel")}
+                </label>
+                <input
+                  className="w-full px-3 py-2 rounded bg-bg-subtle border border-border"
+                  value={poolScopeId}
+                  onChange={(e) => {
+                    setPoolScopeId(e.target.value);
+                    setPoolLoaded(false);
+                    setPoolMembers([]);
+                  }}
+                  placeholder={t("poolScopeIdPlaceholder")}
+                  data-testid="proxy-registry-pool-scopeid"
+                />
+              </div>
+            )}
+          </div>
+
+          <div>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon="search"
+              onClick={loadPool}
+              loading={poolLoading}
+              data-testid="proxy-registry-pool-load"
+            >
+              {t("poolLoad")}
+            </Button>
+          </div>
+
+          {poolLoaded && (
+            <>
+              <div>
+                <label className="text-xs text-text-muted mb-1 block">
+                  {t("poolStrategyLabel")}
+                </label>
+                <select
+                  className="w-full px-3 py-2 rounded bg-bg-subtle border border-border"
+                  value={poolStrategy}
+                  onChange={(e) =>
+                    handlePoolStrategyChange(e.target.value as "round-robin" | "random" | "sticky")
+                  }
+                  data-testid="proxy-registry-pool-strategy"
+                >
+                  <option value="round-robin">{t("strategyRoundRobin")}</option>
+                  <option value="random">{t("strategyRandom")}</option>
+                  <option value="sticky">{t("strategySticky")}</option>
+                </select>
+                <p className="text-xs text-text-muted mt-1">{t("poolStrategyHint")}</p>
+              </div>
+
+              <div>
+                <label className="text-xs text-text-muted mb-1 block">
+                  {t("poolMembersLabel", { count: poolMembers.length })}
+                </label>
+                {poolMembers.length === 0 ? (
+                  <div className="text-sm text-text-muted px-3 py-2 rounded border border-border bg-bg-subtle">
+                    {t("poolNoMembers")}
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-1" data-testid="proxy-registry-pool-members">
+                    {poolMembers.map((proxyId) => {
+                      const proxy = items.find((it) => it.id === proxyId);
+                      return (
+                        <div
+                          key={proxyId}
+                          className="flex items-center justify-between px-3 py-2 rounded border border-border bg-bg-subtle"
+                        >
+                          <span className="text-sm">
+                            {proxy
+                              ? `${proxy.name} (${proxy.type}://${proxy.host}:${proxy.port})`
+                              : proxyId}
+                          </span>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            icon="delete"
+                            onClick={() => handlePoolRemoveMember(proxyId)}
+                            loading={poolSaving}
+                          >
+                            {t("poolRemove")}
+                          </Button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-end gap-2 pt-2 border-t border-border">
+                <div className="flex-1">
+                  <label className="text-xs text-text-muted mb-1 block">{t("poolAddLabel")}</label>
+                  <select
+                    className="w-full px-3 py-2 rounded bg-bg-subtle border border-border"
+                    value={poolAddProxyId}
+                    onChange={(e) => setPoolAddProxyId(e.target.value)}
+                    data-testid="proxy-registry-pool-add-select"
+                  >
+                    <option value="">{t("poolSelectProxy")}</option>
+                    {items
+                      .filter((item) => !poolMembers.includes(item.id))
+                      .map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name} ({item.type}://{item.host}:{item.port})
+                        </option>
+                      ))}
+                  </select>
+                </div>
+                <Button
+                  size="sm"
+                  icon="add"
+                  onClick={handlePoolAddMember}
+                  loading={poolSaving}
+                  disabled={!poolAddProxyId}
+                  data-testid="proxy-registry-pool-add"
+                >
+                  {t("poolAddMember")}
+                </Button>
+              </div>
+            </>
+          )}
+
+          <div className="flex items-center justify-end gap-2 pt-2 border-t border-border">
+            <Button size="sm" variant="secondary" onClick={() => setPoolOpen(false)}>
+              {t("close")}
             </Button>
           </div>
         </div>

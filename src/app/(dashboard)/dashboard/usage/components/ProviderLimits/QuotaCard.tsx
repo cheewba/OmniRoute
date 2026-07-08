@@ -1,10 +1,12 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import Card from "@/shared/components/Card";
+import { pickDisplayValue } from "@/shared/utils/maskEmail";
 import { normalizePlanTier, resolvePlanValue, worstStatus, type CardStatus } from "./utils";
 import QuotaCardHeader from "./parts/QuotaCardHeader";
 import QuotaCardExpanded from "./parts/QuotaCardExpanded";
+import ProviderUsdCostModal from "./ProviderUsdCostModal";
 
 const STATUS_BORDER: Record<CardStatus, string> = {
   critical: "#ef4444",
@@ -12,6 +14,8 @@ const STATUS_BORDER: Record<CardStatus, string> = {
   ok: "#22c55e",
   empty: "transparent",
 };
+
+const EMPTY_QUOTAS: any[] = [];
 
 interface QuotaCardProps {
   connection: any;
@@ -30,6 +34,10 @@ interface QuotaCardProps {
   providerLabel: string;
   onRefresh: () => void;
   onOpenCutoff: () => void;
+  onRedeemResetCredit?: () => void;
+  onToggleActive: (nextActive: boolean) => void;
+  togglingActive: boolean;
+  redeemingResetCredit?: boolean;
 }
 
 export default function QuotaCard({
@@ -42,8 +50,14 @@ export default function QuotaCard({
   providerLabel,
   onRefresh,
   onOpenCutoff,
+  onRedeemResetCredit,
+  onToggleActive,
+  togglingActive,
+  redeemingResetCredit = false,
 }: QuotaCardProps) {
-  const quotas = quota?.quotas ?? [];
+  const isActive = connection.isActive ?? true;
+  const [costModalOpen, setCostModalOpen] = useState(false);
+  const quotas = quota?.quotas ?? EMPTY_QUOTAS;
   const cardStatus = useMemo<CardStatus>(() => worstStatus(quotas), [quotas]);
   const tierMeta = useMemo(
     () =>
@@ -56,17 +70,31 @@ export default function QuotaCard({
     () => resolvePlanValue(quota?.plan ?? null, connection.providerSpecificData ?? null),
     [quota?.plan, connection.providerSpecificData]
   );
+  const accountLabel = useMemo(
+    () =>
+      pickDisplayValue(
+        [connection.name, connection.displayName, connection.email],
+        emailsVisible,
+        connection.provider
+      ) ||
+      connection.id ||
+      connection.provider,
+    [connection, emailsVisible]
+  );
 
   const overrides = (connection.quotaWindowThresholds as Record<string, number> | null) || null;
   const hasOverrides = !!overrides && Object.keys(overrides).length > 0;
   const hasStaleData = !!quota?.stale;
   const displayRefreshedAt = quota?.stale?.since || refreshedAt;
   const canEditCutoff = quotas.some((q: any) => q && typeof q.name === "string" && !q.isCredits);
+  const canRedeemResetCredit =
+    connection.provider === "codex" &&
+    quotas.some((q: any) => q?.isResetCredits && Number(q.creditCount ?? q.remaining ?? 0) > 0);
 
   return (
     <Card
       padding="none"
-      className="flex flex-col overflow-hidden"
+      className={`flex flex-col overflow-hidden transition-opacity ${isActive ? "" : "opacity-60"}`}
       style={{ borderLeft: `3px solid ${STATUS_BORDER[cardStatus]}` }}
     >
       <QuotaCardHeader
@@ -77,20 +105,31 @@ export default function QuotaCard({
         resolvedPlan={resolvedPlan}
         emailsVisible={emailsVisible}
         hasStaleData={hasStaleData}
-        refreshing={loading}
-        onRefresh={onRefresh}
-        onOpenCutoff={onOpenCutoff}
-        hasCutoffOverrides={hasOverrides}
+        onToggleActive={onToggleActive}
+        togglingActive={togglingActive}
       />
       <QuotaCardExpanded
         quotas={quotas}
         loading={loading}
         error={error}
+        message={quota?.message ?? null}
         refreshedAt={displayRefreshedAt}
         hasStaleData={hasStaleData}
         onRefresh={onRefresh}
         onOpenCutoff={onOpenCutoff}
+        onOpenCost={() => setCostModalOpen(true)}
+        onRedeemResetCredit={onRedeemResetCredit}
         canEditCutoff={canEditCutoff}
+        hasCutoffOverrides={hasOverrides}
+        canRedeemResetCredit={canRedeemResetCredit}
+        redeemingResetCredit={redeemingResetCredit}
+      />
+      <ProviderUsdCostModal
+        isOpen={costModalOpen}
+        onClose={() => setCostModalOpen(false)}
+        connection={connection}
+        providerLabel={providerLabel}
+        accountLabel={accountLabel}
       />
     </Card>
   );

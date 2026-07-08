@@ -1,7 +1,7 @@
 ---
 title: "User Guide"
-version: 3.8.2
-lastUpdated: 2026-05-13
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # User Guide
@@ -35,31 +35,28 @@ Complete guide for configuring providers, creating combos, integrating CLI tools
 
 ## 💰 Pricing at a Glance
 
-| Tier                | Provider          | Cost        | Quota Reset      | Best For             |
-| ------------------- | ----------------- | ----------- | ---------------- | -------------------- |
-| **💳 SUBSCRIPTION** | Claude Code (Pro) | $20/mo      | 5h + weekly      | Already subscribed   |
-|                     | Codex (Plus/Pro)  | $20-200/mo  | 5h + weekly      | OpenAI users         |
-|                     | Gemini CLI        | **FREE**    | 180K/mo + 1K/day | Everyone!            |
-|                     | GitHub Copilot    | $10-19/mo   | Monthly          | GitHub users         |
-| **🔑 API KEY**      | DeepSeek          | Pay per use | None             | Cheap reasoning      |
-|                     | Groq              | Pay per use | None             | Ultra-fast inference |
-|                     | xAI (Grok)        | Pay per use | None             | Grok 4 reasoning     |
-|                     | Mistral           | Pay per use | None             | EU-hosted models     |
-|                     | Perplexity        | Pay per use | None             | Search-augmented     |
-|                     | Together AI       | Pay per use | None             | Open-source models   |
-|                     | Fireworks AI      | Pay per use | None             | Fast FLUX images     |
-|                     | Cerebras          | Pay per use | None             | Wafer-scale speed    |
-|                     | Cohere            | Pay per use | None             | Command R+ RAG       |
-|                     | NVIDIA NIM        | Pay per use | None             | Enterprise models    |
-|                     | Baidu Qianfan     | Pay per use | None             | ERNIE models         |
-| **💰 CHEAP**        | GLM-4.7           | $0.6/1M     | Daily 10AM       | Budget backup        |
-|                     | MiniMax M2.1      | $0.2/1M     | 5-hour rolling   | Cheapest option      |
-|                     | Kimi K2           | $9/mo flat  | 10M tokens/mo    | Predictable cost     |
-| **🆓 FREE**         | Qoder             | $0          | Unlimited        | 8 models free        |
-|                     | Qwen              | $0          | Unlimited        | 3 models free        |
-|                     | Kiro              | $0          | Unlimited        | Claude free          |
-
-**💡 Pro Tip:** Start with Gemini CLI (180K free/month) + Qoder (unlimited free) combo = $0 cost!
+| Tier                | Provider          | Cost        | Quota Reset    | Best For             |
+| ------------------- | ----------------- | ----------- | -------------- | -------------------- |
+| **💳 SUBSCRIPTION** | Claude Code (Pro) | $20/mo      | 5h + weekly    | Already subscribed   |
+|                     | Codex (Plus/Pro)  | $20-200/mo  | 5h + weekly    | OpenAI users         |
+|                     | GitHub Copilot    | $10-19/mo   | Monthly        | GitHub users         |
+| **🔑 API KEY**      | DeepSeek          | Pay per use | None           | Cheap reasoning      |
+|                     | Groq              | Pay per use | None           | Ultra-fast inference |
+|                     | xAI (Grok)        | Pay per use | None           | Grok 4 reasoning     |
+|                     | Mistral           | Pay per use | None           | EU-hosted models     |
+|                     | Perplexity        | Pay per use | None           | Search-augmented     |
+|                     | Together AI       | Pay per use | None           | Open-source models   |
+|                     | Fireworks AI      | Pay per use | None           | Fast FLUX images     |
+|                     | Cerebras          | Pay per use | None           | Wafer-scale speed    |
+|                     | Cohere            | Pay per use | None           | Command R+ RAG       |
+|                     | NVIDIA NIM        | Pay per use | None           | Enterprise models    |
+|                     | Baidu Qianfan     | Pay per use | None           | ERNIE models         |
+| **💰 CHEAP**        | GLM-4.7           | $0.6/1M     | Daily 10AM     | Budget backup        |
+|                     | MiniMax M2.1      | $0.2/1M     | 5-hour rolling | Cheapest option      |
+|                     | Kimi K2           | $9/mo flat  | 10M tokens/mo  | Predictable cost     |
+| **🆓 FREE**         | Qoder             | $0          | Unlimited      | 8 models free        |
+|                     | Qwen              | $0          | Unlimited      | 3 models free        |
+|                     | Kiro              | $0          | ~50 credits/mo | Claude free          |
 
 ---
 
@@ -85,9 +82,8 @@ vs. $20 + hitting limits = frustration
 
 ```
 Combo: "free-forever"
-  1. gemini-cli/gemini-3-flash-preview  (180K free/month)
-  2. if/kimi-k2       (unlimited free)
-  3. qw/qwen3-coder-plus       (unlimited free)
+  1. if/kimi-k2       (unlimited free)
+  2. qw/qwen3-coder-plus       (unlimited free)
 
 Monthly cost: $0
 Quality: Production-ready models
@@ -144,6 +140,10 @@ Models:
 
 **Pro Tip:** Use Opus for complex tasks, Sonnet for speed. OmniRoute tracks quota per model!
 
+Claude and Claude Code-compatible routes preserve `max` thinking effort for Opus and Sonnet
+models. Haiku models do not accept the `max` effort tier, so OmniRoute downgrades that
+request to a high thinking budget before sending it upstream.
+
 #### OpenAI Codex (Plus/Pro)
 
 ```bash
@@ -157,21 +157,6 @@ Models:
   cx/gpt-5.3-codex
   cx/gpt-5.3-codex-spark
 ```
-
-#### Gemini CLI (FREE 180K/month!)
-
-```bash
-Dashboard → Providers → Connect Gemini CLI
-→ Google OAuth
-→ 180K completions/month + 1K/day
-
-Models:
-  gemini-cli/gemini-3.1-pro-preview
-  gemini-cli/gemini-3-flash-preview
-  gemini-cli/gemini-3.1-flash-lite-preview
-```
-
-**Best Value:** Huge free tier! Use this before paid tiers.
 
 #### GitHub Copilot
 
@@ -221,6 +206,10 @@ Models:
 
 ### 🆓 FREE Providers
 
+No-auth free providers have a switch beside **No authentication required** on their provider page.
+Turning it off disables that provider, removes it from Providers configured/compact views, and
+removes its models from `/v1/models`.
+
 #### Qoder (8 FREE models)
 
 ```bash
@@ -232,7 +221,7 @@ Models: if/kimi-k2, if/qwen3-coder-plus, if/qwen3-max, if/qwen3-235b, if/deepsee
 #### Kiro (Claude FREE)
 
 ```bash
-Dashboard → Connect Kiro → AWS Builder ID or Google/GitHub → Unlimited
+Dashboard → Connect Kiro → AWS Builder ID or Google/GitHub → ~50 credits/month
 
 Models: kr/claude-sonnet-4.5, kr/claude-haiku-4.5
 ```
@@ -262,9 +251,8 @@ Use in CLI: premium-coding
 ```
 Name: free-combo
 Models:
-  1. gemini-cli/gemini-3-flash-preview (180K free/month)
-  2. if/kimi-k2 (unlimited)
-  3. qw/coder-model (unlimited)
+  1. if/kimi-k2 (unlimited)
+  2. qw/coder-model (unlimited)
 
 Cost: $0 forever!
 ```
@@ -556,7 +544,7 @@ post_install() {
 | `NEXT_PUBLIC_CLOUD_URL`                 | `https://omniroute.dev`              | Cloud sync endpoint base URL (replaces legacy `CLOUD_URL`)                                                |
 | `API_KEY_SECRET`                        | `endpoint-proxy-api-key-secret`      | HMAC secret for generated API keys                                                                        |
 | `REQUIRE_API_KEY`                       | `false`                              | Enforce Bearer API key on `/v1/*`                                                                         |
-| `ALLOW_API_KEY_REVEAL`                  | `false`                              | Allow Api Manager to copy full API keys on demand                                                         |
+| `ALLOW_API_KEY_REVEAL`                  | `false`                              | Allow authenticated dashboard users to reveal full stored API key values on demand                        |
 | `PROVIDER_LIMITS_SYNC_INTERVAL_MINUTES` | `70`                                 | Server-side refresh cadence for cached Provider Limits data; UI refresh buttons still trigger manual sync |
 | `DISABLE_SQLITE_AUTO_BACKUP`            | `false`                              | Disable automatic SQLite snapshots before writes/import/restore; manual backups still work                |
 | `APP_LOG_TO_FILE`                       | `true`                               | Enables application and audit log output to disk                                                          |
@@ -578,11 +566,9 @@ For the full environment variable reference, see the [README](../README.md).
 
 > The list below is curated from `open-sse/config/providerRegistry.ts` for v3.8.0. Cloud catalogs (Gemini, OpenRouter, etc.) are synced dynamically — for the full live catalog open **Dashboard → Providers → [provider] → Available Models** or call `GET /api/models/catalog`.
 
-**Claude Code (`cc/`)** — Pro/Max OAuth: `cc/claude-opus-4-7`, `cc/claude-opus-4-6`, `cc/claude-opus-4-5-20251101`, `cc/claude-sonnet-4-6`, `cc/claude-sonnet-4-5-20250929`, `cc/claude-haiku-4-5-20251001`
+**Claude Code (`cc/`)** — Pro/Max OAuth: `cc/claude-opus-4-8`, `cc/claude-opus-4-7`, `cc/claude-opus-4-6`, `cc/claude-opus-4-5-20251101`, `cc/claude-sonnet-4-6`, `cc/claude-sonnet-4-5-20250929`, `cc/claude-haiku-4-5-20251001`
 
-**Codex (`cx/`)** — Plus/Pro OAuth: `cx/gpt-5.5` (+ effort tiers: `gpt-5.5-xhigh`, `gpt-5.5-high`, `gpt-5.5-medium`, `gpt-5.5-low`), `cx/gpt-5.4`, `cx/gpt-5.4-mini`, `cx/gpt-5.3-codex`, `cx/gpt-5.3-codex-spark`, `cx/gpt-5.2`
-
-**Gemini CLI (`gemini-cli/`)** — FREE OAuth: `gemini-cli/gemini-3.1-pro-preview`, `gemini-cli/gemini-3.1-pro-preview-customtools`, `gemini-cli/gemini-3-flash-preview`, `gemini-cli/gemini-3.1-flash-lite-preview`
+**Codex (`cx/`)** — Plus/Pro OAuth: `cx/gpt-5.5` (+ effort tiers: `gpt-5.5-xhigh`, `gpt-5.5-high`, `gpt-5.5-medium`, `gpt-5.5-low`), `cx/gpt-5.4`, `cx/gpt-5.4-mini`, `cx/gpt-5.3-codex`, `cx/gpt-5.3-codex-spark`
 
 **GitHub Copilot (`gh/`)** — OAuth: `gh/gpt-5.5`, `gh/gpt-5.4`, `gh/gpt-5.4-mini`, `gh/gpt-5-mini`, `gh/gpt-5.3-codex`, `gh/claude-opus-4.7`, `gh/claude-opus-4.6`, `gh/claude-opus-4-5-20251101`, `gh/claude-sonnet-4.6`, `gh/claude-sonnet-4.5`, `gh/claude-haiku-4.5`, `gh/gemini-3.1-pro-preview`, `gh/gemini-3-flash-preview`, `gh/oswe-vscode-prime`
 
@@ -626,7 +612,7 @@ For the full environment variable reference, see the [README](../README.md).
 
 **Other compatible providers** (selected): `cohere`, `databricks`, `snowflake`, `together`, `vertex`, `alibaba`, `alibaba-cn`, `bedrock` (via `aws-bedrock`), `azure-ai`, `openrouter` (passthrough catalog), `siliconflow`, `hyperbolic`, `huggingface`, `featherless-ai`, `cloudflare-ai`, `scaleway`, `deepinfra`, `vercel-ai-gateway`, `bazaarlink`, `friendliai`, `nous-research`, `reka`, `volcengine`, `ai21`, `gigachat`. Each maintains its own model list in `providerRegistry.ts` and can be auto-synced when the provider exposes a `/models` endpoint.
 
-**Note on model IDs:** OmniRoute uses provider-native IDs (`claude-opus-4-7`, `gpt-5.5`, `glm-5.1`, `MiniMax-M2.7`, `kimi-k2.5`, `grok-4.20-0309-reasoning`). Some IDs include dotted versions because that is how the upstream API expects them. If a model is not listed above, run `omniroute models --search <term>` or hit `GET /api/models/catalog` to confirm availability.
+**Note on model IDs:** OmniRoute uses provider-native IDs (`claude-opus-4-8`, `gpt-5.5`, `glm-5.1`, `MiniMax-M2.7`, `kimi-k2.5`, `grok-4.20-0309-reasoning`). Some IDs include dotted versions because that is how the upstream API expects them. If a model is not listed above, run `omniroute models --search <term>` or hit `GET /api/models/catalog` to confirm availability.
 
 </details>
 
@@ -822,10 +808,12 @@ OmniRoute implements provider-level resilience with five components:
    - **Use Upstream Retry Hints** — Honors authoritative `Retry-After` or reset hints when provided
    - **Max Backoff Steps** — Maximum exponential backoff level for repeated failures
 
-3. **Provider Circuit Breaker** — Tracks end-to-end provider failures and automatically opens the breaker when the configured threshold is reached:
-   - **Failure Threshold** — Consecutive provider failures before opening the breaker
+3. **Provider Circuit Breaker** — Tracks end-to-end provider failures, marks a provider degraded at the configured warning threshold, and opens the breaker when the configured failure threshold is reached:
+   - **Degradation Threshold** — Consecutive provider failures before entering `DEGRADED`
+   - **Failure Threshold** — Consecutive provider failures before entering `OPEN`
    - **Reset Timeout** — Time window before the provider is tested again
    - **CLOSED** (Healthy) — Requests flow normally
+   - **DEGRADED** — Requests still flow while elevated failures are tracked
    - **OPEN** — Provider is temporarily blocked after repeated failures
    - **HALF_OPEN** — Testing if provider has recovered
 
@@ -886,6 +874,11 @@ The settings page is organized into **7 tabs** for easy navigation:
 | **Routing**    | Global routing strategy (Fill First / Round Robin / P2C / Random / Least Used / Cost Optimized), wildcard model aliases, fallback chains, combo defaults |
 | **Resilience** | Request queue, connection cooldown, provider breaker config, and wait-for-cooldown behavior                                                              |
 | **Advanced**   | Global proxy configuration (HTTP/SOCKS5), per-provider proxy overrides                                                                                   |
+
+General no longer duplicates read-only logging and cache notes. Database retention and
+optimization settings are persisted through `/api/settings/database`; manual cache clearing uses
+`DELETE /api/cache`. Request and proxy log row caps are controlled by
+`CALL_LOGS_TABLE_MAX_ROWS` and `PROXY_LOGS_TABLE_MAX_ROWS`.
 
 ---
 
@@ -973,6 +966,21 @@ Configure per-combo balancing in **Dashboard → Combos → Create/Edit → Stra
 | **Cost-Optimized** | Routes to the cheapest available model (uses pricing table)              |
 
 Global combo defaults can be set in **Dashboard → Settings → Routing → Combo Defaults**.
+Combo target timeouts inherit the current request timeout by default. Use **Target timeout
+(seconds)** on combo defaults or an individual combo only when a shorter per-target limit should
+trigger faster fallback.
+
+Zero-latency combo optimizations are opt-in. Leave **Zero-latency optimizations** disabled to
+prevent these latency features from racing fallback targets, skipping targets based on TTFT
+history, or compressing fallback requests; enabling it allows configured hedging, predictive TTFT
+skips, and proactive fallback compression to trade routing/request fidelity for lower tail
+latency.
+
+Disable **Reasoning token buffer** when upstream providers require strict
+`max_tokens` / `maxOutputTokens` limits. When enabled, combo routing only adds reasoning-model
+headroom for models with a known output cap and leaves the client token limit unchanged when the
+safe buffered value would exceed that cap. If the client limit is already above a known cap,
+OmniRoute clamps it down to that cap before sending the upstream request.
 
 ---
 
@@ -1051,7 +1059,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
 
 ### Connect Cursor / Continue / VS Code MCP
 
-Use the SSE URL `http://localhost:20128/api/mcp/sse` and a Bearer API key generated in **Dashboard → API Manager**.
+Use the SSE URL `http://localhost:20128/api/mcp/sse` and a Bearer API key generated in **Dashboard → API Keys**.
 
 ### Scopes
 
@@ -1113,7 +1121,7 @@ Full reference: [CLOUD_AGENT.md](../frameworks/CLOUD_AGENT.md).
 
 You can manage every OmniRoute resource (providers, combos, keys, settings) over HTTP using a **Bearer key with the `manage` scope**.
 
-Generate the key in **Dashboard → API Manager → New Key → Scope: manage**, then:
+Generate the key in **Dashboard → API Keys → New Key → Scope: manage**, then:
 
 ```bash
 # List providers

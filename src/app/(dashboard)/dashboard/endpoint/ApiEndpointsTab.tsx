@@ -4,6 +4,8 @@ import { useState, useEffect, useMemo } from "react";
 import { useTranslations } from "next-intl";
 import { Card } from "@/shared/components";
 import { useDisplayBaseUrl } from "@/shared/hooks";
+import VscodeTokenAliasCard from "./VscodeTokenAliasCard";
+import { matchesSearch } from "@/shared/utils/turkishText";
 
 /* ─── Types ──────────────────────────────────────────── */
 interface Endpoint {
@@ -15,7 +17,11 @@ interface Endpoint {
   security: boolean;
   parameters: any[];
   requestBody: boolean;
+  exampleBody?: any;
   responses: string[];
+  loopbackOnly?: boolean;
+  alwaysProtected?: boolean;
+  internal?: boolean;
 }
 
 interface CatalogData {
@@ -47,18 +53,61 @@ const METHOD_COLORS: Record<string, string> = {
 export default function ApiEndpointsTab() {
   const t = useTranslations("endpoint");
   const baseUrl = useDisplayBaseUrl();
+
+  function EndpointBadges({ ep }: { ep: Endpoint }) {
+    return (
+      <div className="flex items-center gap-1 shrink-0">
+        {ep.loopbackOnly && (
+          <span
+            className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 border border-blue-500/30"
+            title={t("badgeLoopbackTooltip")}
+          >
+            LOCAL
+          </span>
+        )}
+        {ep.alwaysProtected && (
+          <span
+            className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 border border-red-500/30"
+            title={t("badgeAlwaysProtectedTooltip")}
+          >
+            PROTECTED
+          </span>
+        )}
+        {ep.internal && (
+          <span
+            className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-gray-500/15 text-gray-400 border border-gray-500/30"
+            title={t("badgeInternalTooltip")}
+          >
+            INTERNAL
+          </span>
+        )}
+      </div>
+    );
+  }
+
   const [catalog, setCatalog] = useState<CatalogData | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [expandedEndpoint, setExpandedEndpoint] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
+  const [showInternal, setShowInternal] = useState(false);
+  const [securityTier, setSecurityTier] = useState<
+    "all" | "public" | "auth" | "loopback" | "always-protected"
+  >("all");
 
   // Try It state
   const [tryingEndpoint, setTryingEndpoint] = useState<string | null>(null);
   const [tryBody, setTryBody] = useState("");
   const [tryResult, setTryResult] = useState<TryItResult | null>(null);
   const [trying, setTrying] = useState(false);
+  const [availableApiKeys, setAvailableApiKeys] = useState<Array<{ id: string; key: string }>>([]);
+  const [selectedApiKeyId, setSelectedApiKeyId] = useState<string>("");
+  const [revealedApiKeys, setRevealedApiKeys] = useState<Record<string, string>>({});
+  const [apiKeyLoadError, setApiKeyLoadError] = useState<string | null>(null);
+  const [manualApiKey, setManualApiKey] = useState("");
+  const [useManualKey, setUseManualKey] = useState(false);
+  const selectedApiKey = availableApiKeys.find((apiKey) => apiKey.id === selectedApiKeyId) || null;
 
   const loadCatalog = async () => {
     try {
@@ -93,19 +142,62 @@ export default function ApiEndpointsTab() {
     };
   }, []);
 
+  // Load API keys for Try It functionality. The list endpoint returns masked
+  // keys; the selected key is revealed only when sending a Try It request.
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/keys?limit=100", { credentials: "same-origin" })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`Failed to load API keys (${res.status})`);
+        return res.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        const rows = Array.isArray(data?.keys) ? data.keys : Array.isArray(data) ? data : [];
+        const keys = rows
+          .filter((k) => k?.id && k.isActive !== false && k.isBanned !== true)
+          .map((k) => ({ id: String(k.id), key: String(k.key || k.id) }));
+        setAvailableApiKeys(keys);
+        setApiKeyLoadError(null);
+        if (keys.length > 0) {
+          setSelectedApiKeyId((current) => current || keys[0].id);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setAvailableApiKeys([]);
+          setApiKeyLoadError(error instanceof Error ? error.message : "Failed to load API keys");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Filter endpoints
   const filteredEndpoints = useMemo(() => {
     if (!catalog) return [];
     return catalog.endpoints.filter((ep) => {
-      const matchesSearch =
+      // Keep the internal-endpoint visibility toggle + security-tier filter
+      // (from release) while using the locale-aware matchesSearch helper. The
+      // local var is matchesEndpoint (not matchesSearch) to avoid shadowing the
+      // imported helper used in its own initializer.
+      if (!showInternal && ep.internal) return false;
+      const matchesEndpoint =
         !search ||
-        ep.path.toLowerCase().includes(search.toLowerCase()) ||
-        ep.summary.toLowerCase().includes(search.toLowerCase()) ||
-        ep.tags.some((t) => t.toLowerCase().includes(search.toLowerCase()));
+        matchesSearch(ep.path, search) ||
+        matchesSearch(ep.summary, search) ||
+        ep.tags.some((t) => matchesSearch(t, search));
       const matchesTag = !selectedTag || ep.tags.includes(selectedTag);
-      return matchesSearch && matchesTag;
+      const matchesTier =
+        securityTier === "all" ||
+        (securityTier === "loopback" && ep.loopbackOnly) ||
+        (securityTier === "always-protected" && ep.alwaysProtected) ||
+        (securityTier === "auth" && ep.security && !ep.loopbackOnly && !ep.alwaysProtected) ||
+        (securityTier === "public" && !ep.security && !ep.loopbackOnly && !ep.alwaysProtected);
+      return matchesEndpoint && matchesTag && matchesTier;
     });
-  }, [catalog, search, selectedTag]);
+  }, [catalog, search, selectedTag, showInternal, securityTier]);
 
   // Group by tag
   const groupedEndpoints = useMemo(() => {
@@ -124,6 +216,13 @@ export default function ApiEndpointsTab() {
   }, [catalog]);
 
   // Try It handler
+  // Generate example body from OpenAPI schema
+  const generateExampleBody = (ep: Endpoint): string => {
+    if (ep.method === "GET") return "";
+    if (ep.exampleBody) return JSON.stringify(ep.exampleBody, null, 2);
+    return "{\n  \n}";
+  };
+
   const handleTryIt = async (ep: Endpoint) => {
     const key = `${ep.method}:${ep.path}`;
     if (tryingEndpoint === key) {
@@ -133,22 +232,67 @@ export default function ApiEndpointsTab() {
     }
     setTryingEndpoint(key);
     setTryResult(null);
-    setTryBody(ep.method === "GET" ? "" : "{\n  \n}");
+    setTryBody(generateExampleBody(ep));
+  };
+
+  const revealSelectedApiKey = async () => {
+    if (!selectedApiKey) return "";
+    if (revealedApiKeys[selectedApiKey.id]) return revealedApiKeys[selectedApiKey.id];
+
+    const res = await fetch(`/api/keys/${encodeURIComponent(selectedApiKey.id)}/reveal`, {
+      credentials: "same-origin",
+    });
+    if (!res.ok) {
+      throw new Error(
+        res.status === 403
+          ? "API key reveal is disabled (ALLOW_API_KEY_REVEAL). Change it in the feature flag page or paste an API key manually."
+          : `Failed to reveal API key (${res.status})`
+      );
+    }
+    const data = await res.json();
+    if (!data?.key || typeof data.key !== "string") {
+      throw new Error("API key reveal returned an invalid response");
+    }
+    setRevealedApiKeys((current) => ({ ...current, [selectedApiKey.id]: data.key }));
+    return data.key;
   };
 
   const executeTryIt = async (ep: Endpoint) => {
     setTrying(true);
     try {
+      const headers: Record<string, string> = {};
+
+      // Add Authorization header if endpoint requires auth
+      if (ep.security) {
+        let apiKeyForRequest = "";
+        if (useManualKey) {
+          apiKeyForRequest = manualApiKey;
+        } else if (selectedApiKey) {
+          apiKeyForRequest = await revealSelectedApiKey();
+        }
+
+        if (apiKeyForRequest) {
+          headers["Authorization"] = `Bearer ${apiKeyForRequest}`;
+        } else {
+          throw new Error("API key is required for this endpoint.");
+        }
+      }
+
       const res = await fetch("/api/openapi/try", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           method: ep.method,
-          path: ep.path.replace("/api/", "/"),
+          path: ep.path,
+          headers,
           body: tryBody ? JSON.parse(tryBody) : undefined,
         }),
       });
       if (res.ok) setTryResult(await res.json());
+      else {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Request failed (${res.status})`);
+      }
     } catch (err: any) {
       setTryResult({
         status: 0,
@@ -220,31 +364,35 @@ export default function ApiEndpointsTab() {
 
       {/* ═══ API CATALOG ═══ */}
       {!catalog && (
-        <Card className="p-6">
-          <div className="flex items-start gap-3">
-            <div className="flex size-10 items-center justify-center rounded-lg bg-red-500/10">
-              <span className="material-symbols-outlined text-[20px] text-red-500">error</span>
-            </div>
-            <div>
-              <h3 className="text-sm font-semibold text-text-main">
-                {t("apiEndpointsCatalogUnavailable")}
-              </h3>
-              <p className="text-xs text-text-muted mt-1">
-                {catalogError || "The OpenAPI specification could not be loaded."}
-              </p>
-              <a
-                href="/api/openapi/spec"
-                target="_blank"
-                rel="noopener"
-                className="inline-flex items-center gap-1 mt-3 px-2.5 py-1.5 text-xs font-medium rounded-lg
+        <>
+          <Card className="p-6">
+            <div className="flex items-start gap-3">
+              <div className="flex size-10 items-center justify-center rounded-lg bg-red-500/10">
+                <span className="material-symbols-outlined text-[20px] text-red-500">error</span>
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-text-main">
+                  {t("apiEndpointsCatalogUnavailable")}
+                </h3>
+                <p className="text-xs text-text-muted mt-1">
+                  {catalogError || "The OpenAPI specification could not be loaded."}
+                </p>
+                <a
+                  href="/api/openapi/spec"
+                  target="_blank"
+                  rel="noopener"
+                  className="inline-flex items-center gap-1 mt-3 px-2.5 py-1.5 text-xs font-medium rounded-lg
                            bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
-              >
-                <span className="material-symbols-outlined text-[14px]">open_in_new</span>
-                Open JSON response
-              </a>
+                >
+                  <span className="material-symbols-outlined text-[14px]">open_in_new</span>
+                  Open JSON response
+                </a>
+              </div>
             </div>
-          </div>
-        </Card>
+          </Card>
+
+          <VscodeTokenAliasCard variant="catalog" />
+        </>
       )}
 
       {catalog && (
@@ -295,7 +443,46 @@ export default function ApiEndpointsTab() {
                 </span>
               )}
             </div>
+            {/* Security tier filter */}
+            <div className="flex items-center gap-1 ml-1 border-l border-black/10 dark:border-white/10 pl-2 flex-wrap">
+              {(["all", "auth", "loopback", "always-protected", "public"] as const).map((tier) => (
+                <button
+                  key={tier}
+                  onClick={() => setSecurityTier(tier)}
+                  className={`px-2 py-1 text-[10px] font-medium rounded-md transition-colors
+                    ${
+                      securityTier === tier
+                        ? "bg-primary/10 text-primary"
+                        : "bg-black/5 dark:bg-white/5 text-text-muted hover:text-text-main"
+                    }`}
+                >
+                  {tier === "all"
+                    ? t("tierAll")
+                    : tier === "auth"
+                      ? t("tierAuth")
+                      : tier === "loopback"
+                        ? t("tierLoopback")
+                        : tier === "always-protected"
+                          ? t("tierAlwaysProtected")
+                          : t("tierPublic")}
+                </button>
+              ))}
+              <button
+                onClick={() => setShowInternal(!showInternal)}
+                className={`px-2 py-1 text-[10px] font-medium rounded-md transition-colors ml-1
+                  ${
+                    showInternal
+                      ? "bg-amber-500/10 text-amber-500"
+                      : "bg-black/5 dark:bg-white/5 text-text-muted hover:text-text-main"
+                  }`}
+                title="Show/hide internal routes (hidden by default)"
+              >
+                {showInternal ? t("hideInternal") : t("showInternal")}
+              </button>
+            </div>
           </div>
+
+          <VscodeTokenAliasCard variant="catalog" />
 
           {/* Endpoint groups */}
           {Object.entries(groupedEndpoints).map(([tag, endpoints]) => (
@@ -335,6 +522,7 @@ export default function ApiEndpointsTab() {
                         <span className="text-[11px] text-text-muted hidden sm:inline truncate max-w-[200px]">
                           {ep.summary}
                         </span>
+                        <EndpointBadges ep={ep} />
                         {ep.security && (
                           <span
                             className="material-symbols-outlined text-[12px] text-amber-500"
@@ -408,7 +596,7 @@ export default function ApiEndpointsTab() {
                             </p>
                             <code className="text-[11px] font-mono text-text-main break-all">
                               curl -X {ep.method} {baseUrl}
-                              {ep.path.replace("/api/", "/")}
+                              {ep.path}
                               {ep.security ? ' -H "Authorization: Bearer YOUR_KEY"' : ""}
                               {ep.requestBody
                                 ? " -H \"Content-Type: application/json\" -d '{...}'"
@@ -419,6 +607,53 @@ export default function ApiEndpointsTab() {
                           {/* Try It panel */}
                           {isTrying && (
                             <div className="rounded-lg border border-primary/20 bg-primary/[0.02] p-3 space-y-3">
+                              {ep.security && (
+                                <div>
+                                  <div className="flex items-center justify-between mb-1">
+                                    <label className="text-[9px] font-semibold text-text-muted uppercase tracking-wider">
+                                      API Key
+                                    </label>
+                                    <button
+                                      type="button"
+                                      onClick={() => setUseManualKey(!useManualKey)}
+                                      className="text-[9px] text-primary hover:underline"
+                                    >
+                                      {useManualKey ? "Switch to Selection" : "Enter Manually"}
+                                    </button>
+                                  </div>
+
+                                  {useManualKey ? (
+                                    <input
+                                      type="password"
+                                      value={manualApiKey}
+                                      onChange={(e) => setManualApiKey(e.target.value)}
+                                      placeholder="Paste your API key here"
+                                      className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-black/10
+                                               dark:border-white/10 bg-white dark:bg-black/30 focus:outline-none
+                                               focus:ring-1 focus:ring-primary"
+                                    />
+                                  ) : availableApiKeys.length > 0 ? (
+                                    <select
+                                      value={selectedApiKeyId}
+                                      onChange={(e) => setSelectedApiKeyId(e.target.value)}
+                                      className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-black/10
+                                               dark:border-white/10 bg-white dark:bg-black/30 focus:outline-none
+                                               focus:ring-1 focus:ring-primary"
+                                    >
+                                      {availableApiKeys.map((apiKey) => (
+                                        <option key={apiKey.id} value={apiKey.id}>
+                                          {apiKey.key}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  ) : (
+                                    <p className="text-[11px] text-amber-500">
+                                      {apiKeyLoadError ||
+                                        "No active API keys found. Toggle manual entry to paste one."}
+                                    </p>
+                                  )}
+                                </div>
+                              )}
                               {ep.method !== "GET" && (
                                 <div>
                                   <label className="text-[9px] font-semibold text-text-muted uppercase tracking-wider">
@@ -427,7 +662,7 @@ export default function ApiEndpointsTab() {
                                   <textarea
                                     value={tryBody}
                                     onChange={(e) => setTryBody(e.target.value)}
-                                    rows={4}
+                                    rows={8}
                                     className="w-full mt-1 px-3 py-2 text-xs font-mono rounded-lg border border-black/10
                                              dark:border-white/10 bg-white dark:bg-black/30 focus:outline-none
                                              focus:ring-1 focus:ring-primary resize-none"

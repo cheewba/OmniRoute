@@ -3,12 +3,16 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import Link from "next/link";
 import { Card, Button, Input, Modal, CardSkeleton, SegmentedControl } from "@/shared/components";
+import Toggle from "@/shared/components/Toggle";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useDisplayBaseUrl } from "@/shared/hooks";
 import { AI_PROVIDERS, getProviderByAlias } from "@/shared/constants/providers";
 import { getProviderDisplayName } from "@/lib/display/names";
 import { useTranslations } from "next-intl";
-import TokenSaverCard from "./components/TokenSaverCard";
+import A2ADashboardPage from "./components/A2ADashboard";
+import McpDashboardPage from "./components/MCPDashboard";
+import NotionSourceCard from "./components/NotionSourceCard";
+import VscodeTokenAliasCard from "./VscodeTokenAliasCard";
 
 const BUILD_TIME_CLOUD_URL = process.env.NEXT_PUBLIC_CLOUD_URL || null;
 const CLOUD_ACTION_TIMEOUT_MS = 15000;
@@ -119,6 +123,15 @@ type EndpointTunnelVisibility = {
   showNgrokTunnel: boolean;
 };
 
+type EndpointTab = "apis" | "mcp" | "a2a" | "context-sources";
+
+const ENDPOINT_TABS: Array<{ value: EndpointTab; label: string; icon: string }> = [
+  { value: "apis", label: "APIs", icon: "api" },
+  { value: "mcp", label: "MCP", icon: "extension" },
+  { value: "a2a", label: "A2A", icon: "hub" },
+  { value: "context-sources", label: "Context Sources", icon: "database" },
+];
+
 const DEFAULT_TUNNEL_VISIBILITY: EndpointTunnelVisibility = {
   showCloudflaredTunnel: true,
   showTailscaleFunnel: true,
@@ -176,6 +189,9 @@ export default function APIPageClient({ machineId }: Readonly<APIPageClientProps
   const [expandedTunnel, setExpandedTunnel] = useState<string | null>(null);
   const [lanUrls, setLanUrls] = useState<string[]>([]);
   const [tailscaleIpUrl, setTailscaleIpUrl] = useState<string | null>(null);
+  const [activeEndpointTab, setActiveEndpointTab] = useState<EndpointTab>("apis");
+  const [customSystemPromptEnabled, setCustomSystemPromptEnabled] = useState(false);
+  const [customSystemPrompt, setCustomSystemPrompt] = useState("");
 
   const { copied, copy } = useCopyToClipboard();
 
@@ -483,6 +499,8 @@ export default function APIPageClient({ machineId }: Readonly<APIPageClientProps
         setShowTailscaleFunnel(tunnelVisibility.showTailscaleFunnel);
         setShowNgrokTunnel(tunnelVisibility.showNgrokTunnel);
         if (data.ngrokAuthToken) setNgrokToken(data.ngrokAuthToken);
+        setCustomSystemPromptEnabled(!!data.customSystemPromptEnabled);
+        setCustomSystemPrompt(data.customSystemPrompt || "");
 
         if (!tunnelVisibility.showCloudflaredTunnel) {
           setCloudflaredStatus(null);
@@ -504,6 +522,24 @@ export default function APIPageClient({ machineId }: Readonly<APIPageClientProps
     }
 
     return DEFAULT_TUNNEL_VISIBILITY;
+  };
+
+  const handleCustomSystemPromptEnabledChange = (value: boolean) => {
+    setCustomSystemPromptEnabled(value);
+    void fetch("/api/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ customSystemPromptEnabled: value }),
+    });
+  };
+
+  const handleCustomSystemPromptChange = (value: string) => {
+    setCustomSystemPrompt(value);
+    void fetch("/api/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ customSystemPrompt: value }),
+    });
   };
 
   const handleCloudToggle = (checked) => {
@@ -1212,6 +1248,22 @@ export default function APIPageClient({ machineId }: Readonly<APIPageClientProps
 
   return (
     <div className="flex flex-col gap-8">
+      <SegmentedControl
+        options={ENDPOINT_TABS}
+        value={activeEndpointTab}
+        onChange={(value) => setActiveEndpointTab(value as EndpointTab)}
+        aria-label="Endpoint sections"
+        className="w-fit"
+      />
+
+      {activeEndpointTab === "mcp" ? <McpDashboardPage /> : null}
+      {activeEndpointTab === "a2a" ? <A2ADashboardPage /> : null}
+      {activeEndpointTab === "context-sources" ? (
+        <div className="flex flex-col gap-4">
+          <NotionSourceCard />
+        </div>
+      ) : null}
+
       {/* Endpoint Card */}
       <Card>
         <h2 className="text-lg font-semibold mb-4">{t("title")}</h2>
@@ -1720,9 +1772,32 @@ export default function APIPageClient({ machineId }: Readonly<APIPageClientProps
             </div>
           )}
         </div>
-      </Card>
 
-      <TokenSaverCard />
+        {/* Custom System Prompt */}
+        <div className="flex items-center justify-between pt-4 mt-4 border-t border-border gap-4 flex-wrap">
+          <div className="min-w-0 flex-1">
+            <p className="font-medium text-sm">{t("customSystemPromptTitle")}</p>
+            <p className="text-sm text-text-muted">{t("customSystemPromptDescription")}</p>
+          </div>
+          <div className="flex items-center gap-3 shrink-0">
+            {customSystemPromptEnabled && (
+              <Input
+                type="text"
+                value={customSystemPrompt}
+                onChange={(e) => handleCustomSystemPromptChange(e.target.value)}
+                placeholder={t("customSystemPromptPlaceholder")}
+                className="w-64 text-xs"
+              />
+            )}
+            <Toggle
+              checked={customSystemPromptEnabled}
+              onChange={handleCustomSystemPromptEnabledChange}
+              ariaLabel={t("customSystemPromptTitle")}
+              size="sm"
+            />
+          </div>
+        </div>
+      </Card>
 
       <Card>
         <div className="flex items-center justify-between mb-5">
@@ -1994,6 +2069,8 @@ export default function APIPageClient({ machineId }: Readonly<APIPageClientProps
               baseUrl={currentEndpoint}
             />
           </div>
+
+          <VscodeTokenAliasCard className="mt-4" />
         </div>
       </Card>
 

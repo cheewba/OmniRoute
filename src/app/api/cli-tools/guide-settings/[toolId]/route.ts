@@ -10,6 +10,7 @@ import { mergeOpenCodeConfigText } from "@/shared/services/opencodeConfig";
 import { guideSettingsSaveSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { resolveApiKey, getOrCreateApiKey } from "@/shared/services/apiKeyResolver";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 /**
  * POST /api/cli-tools/guide-settings/:toolId
@@ -77,7 +78,10 @@ export async function POST(request, { params }) {
         );
     }
   } catch (error) {
-    return NextResponse.json({ error: (error as any).message }, { status: 500 });
+    return NextResponse.json(
+      { error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)) },
+      { status: 500 }
+    );
   }
 }
 
@@ -134,6 +138,7 @@ async function saveContinueConfig({ baseUrl, apiKey, model }) {
         normalizeApiBase(m.apiBase).includes("omniroute") ||
         normalizeApiBase(m.apiBase).includes(`localhost:${apiPort}`) ||
         normalizeApiBase(m.apiBase).includes(`127.0.0.1:${apiPort}`) ||
+        // eslint-disable-next-line no-restricted-syntax -- teknik string kontrolü, kullanıcı metni araması değil
         String(m.apiKey || "")
           .toLowerCase()
           .includes("sk_omniroute"))
@@ -158,9 +163,9 @@ async function saveContinueConfig({ baseUrl, apiKey, model }) {
 }
 
 /**
- * Save OpenCode config to:
- * - Linux/macOS: ~/.config/opencode/opencode.json (XDG_CONFIG_HOME aware)
- * - Windows: %APPDATA%/opencode/opencode.json
+ * Save OpenCode config to ~/.config/opencode/opencode.json on ALL platforms
+ * (XDG_CONFIG_HOME aware). OpenCode uses XDG `~/.config` even on Windows
+ * (%USERPROFILE%\.config), NOT %APPDATA% (#3330).
  *
  * (#524) OpenCode was silently failing because this handler was missing.
  */
@@ -217,7 +222,7 @@ async function saveQwenConfig({ baseUrl, apiKey, model }) {
     .trim()
     .replace(/\/+$/, "");
   const resolvedApiKey = apiKey || "sk_omniroute";
-  const resolvedModel = model || "gemini-cli/gemini-3.1-pro-preview";
+  const resolvedModel = model || "qwen/qwen3-coder-plus";
 
   // Read existing config to preserve other settings (permissions, mcpServers, etc.)
   let existingConfig: Record<string, any> = {};

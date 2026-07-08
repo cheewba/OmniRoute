@@ -9,19 +9,7 @@
  */
 
 import { z } from "zod";
-
-const SERVICE_KIND_VALUES = [
-  "llm",
-  "embedding",
-  "image",
-  "imageToText",
-  "tts",
-  "stt",
-  "webSearch",
-  "webFetch",
-  "video",
-  "music",
-] as const;
+import { SERVICE_KIND_VALUES } from "@/shared/constants/serviceKinds";
 
 export const ProviderSchema = z.object({
   id: z.string().min(1),
@@ -33,7 +21,8 @@ export const ProviderSchema = z.object({
   website: z.string().url().optional(),
   passthroughModels: z.boolean().optional(),
   subscriptionRisk: z.boolean().optional(),
-  riskNoticeVariant: z.enum(["oauth", "webCookie", "deprecated"]).optional(),
+  riskNoticeVariant: z.enum(["oauth", "webCookie", "deprecated", "embedded-service"]).optional(),
+  isEmbeddedService: z.boolean().optional(),
   deprecated: z.boolean().optional(),
   deprecationReason: z.string().optional(),
   hasFree: z.boolean().optional(),
@@ -41,6 +30,8 @@ export const ProviderSchema = z.object({
   authHint: z.string().optional(),
   apiHint: z.string().optional(),
   serviceKinds: z.array(z.enum(SERVICE_KIND_VALUES)).optional(),
+  noAuth: z.boolean().optional(),
+  anonymousFallback: z.boolean().optional(),
 });
 
 export const ProvidersMapSchema = z.record(z.string(), ProviderSchema);

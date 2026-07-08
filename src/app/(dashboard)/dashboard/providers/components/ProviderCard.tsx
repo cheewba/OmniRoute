@@ -26,7 +26,7 @@ interface ProviderStats {
   errorTime?: string | null;
   allDisabled?: boolean;
   expiryStatus?: "expired" | "expiring_soon" | string | null;
-  codexFastActive?: boolean;
+  codexServiceTier?: "default" | "priority" | "flex" | null;
 }
 
 const KIND_LABEL: Record<string, string> = {
@@ -56,6 +56,10 @@ interface ProviderCardProps {
     subscriptionRisk?: boolean;
     /** Declared service kinds — "llm" enables the inline Test button */
     serviceKinds?: string[];
+    /** Optional operator-supplied remote icon URL (#2166) for compatible provider nodes. */
+    iconUrl?: string;
+    /** Short text-badge fallback (e.g. "OC"/"AC"/"CC") shown if `iconUrl` fails to load. */
+    textIcon?: string;
   };
   stats: ProviderStats;
   authType?: string;
@@ -75,6 +79,28 @@ const DOT_COLORS: Record<string, string> = {
   "upstream-proxy": "bg-indigo-500",
   "cloud-agent": "bg-violet-500",
 };
+
+type ProviderMessageTranslator = ((key: string, values?: Record<string, unknown>) => string) & {
+  has?: (key: string) => boolean;
+};
+
+function providerText(
+  t: ProviderMessageTranslator,
+  key: string,
+  fallback: string,
+  values?: Record<string, unknown>
+): string {
+  if (typeof t.has === "function" && t.has(key)) {
+    return t(key, values);
+  }
+  if (values) {
+    return Object.entries(values).reduce(
+      (acc, [name, value]) => acc.replaceAll(`{${name}}`, String(value)),
+      fallback
+    );
+  }
+  return fallback;
+}
 
 function getStatusDisplay(
   connected: number,
@@ -152,15 +178,27 @@ export default function ProviderCard({
   const isCompatible = isOpenAICompatibleProvider(providerId);
   const isCcCompatible = isClaudeCodeCompatibleProvider(providerId);
   const isAnthropicCompatible = isAnthropicCompatibleProvider(providerId) && !isCcCompatible;
-  const codexFastChip =
-    providerId === "codex" && stats.codexFastActive ? (
+  const codexServiceTierLabel =
+    stats.codexServiceTier === "flex"
+      ? providerText(t, "codexTierFlexLabel", "Flex")
+      : providerText(t, "codexTierFastLabel", "Fast");
+  const codexServiceTierChip =
+    providerId === "codex" && stats.codexServiceTier && stats.codexServiceTier !== "default" ? (
       <span
-        key="fast"
-        className="inline-flex items-center gap-0.5 rounded-full bg-sky-500/10 px-1.5 py-0 text-[9px] font-semibold uppercase tracking-wide text-sky-600 dark:text-sky-400"
-        title={t("codexFastTierActiveChip")}
+        key="codex-service-tier"
+        className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0 text-[9px] font-semibold uppercase tracking-wide ${
+          stats.codexServiceTier === "flex"
+            ? "bg-cyan-500/10 text-cyan-600 dark:text-cyan-400"
+            : "bg-sky-500/10 text-sky-600 dark:text-sky-400"
+        }`}
+        title={providerText(t, "codexServiceTierActive", "Codex {tier} service tier is active", {
+          tier: codexServiceTierLabel,
+        })}
       >
-        <span className="material-symbols-outlined text-[10px] leading-none">bolt</span>
-        {t("tierFast")}
+        <span className="material-symbols-outlined text-[10px] leading-none">
+          {stats.codexServiceTier === "flex" ? "speed" : "bolt"}
+        </span>
+        {codexServiceTierLabel}
       </span>
     ) : null;
 
@@ -197,7 +235,7 @@ export default function ProviderCard({
       <Link href={`/dashboard/providers/${providerId}`} className="group flex-1 flex flex-col">
         <Card
           padding="xs"
-          className={`h-full flex flex-col hover:bg-black/[0.01] dark:hover:bg-white/[0.01] transition-colors cursor-pointer ${allDisabled ? "opacity-50" : ""} ${provider.deprecated ? "opacity-60" : ""}`}
+          className={`h-full flex flex-col hover:bg-black/5 dark:hover:bg-white/5 hover:border-primary/40 transition-colors cursor-pointer ${allDisabled ? "opacity-50" : ""} ${provider.deprecated ? "opacity-60" : ""}`}
         >
           <div className="flex flex-col gap-2 h-full">
             {/* Row 1 — Identity: icon + full name + risk/category indicators */}
@@ -206,7 +244,17 @@ export default function ProviderCard({
                 className="size-9 rounded-lg flex items-center justify-center shrink-0"
                 style={{ backgroundColor: `${provider.color || "#64748b"}15` }}
               >
-                {staticIconPath ? (
+                {provider.iconUrl ? (
+                  <ProviderIcon
+                    providerId={provider.id || providerId}
+                    src={provider.iconUrl}
+                    alt={provider.name}
+                    size={26}
+                    className="max-h-[26px] max-w-[26px] rounded-lg object-contain"
+                    fallbackText={provider.textIcon}
+                    fallbackColor={provider.color}
+                  />
+                ) : staticIconPath ? (
                   <Image
                     src={staticIconPath}
                     alt={provider.name}
@@ -305,7 +353,7 @@ export default function ProviderCard({
                       Number(stats.warning || 0),
                       stats.errorCode,
                       t,
-                      codexFastChip
+                      codexServiceTierChip
                     )}
                     {stats.expiryStatus === "expired" && (
                       <Badge variant="error" size="sm" dot>

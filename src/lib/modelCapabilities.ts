@@ -3,8 +3,16 @@ import {
   PROVIDER_MODELS,
 } from "@omniroute/open-sse/config/providerModels.ts";
 import { parseModel, resolveCanonicalProviderModel } from "@omniroute/open-sse/services/model.ts";
-import { MODEL_SPECS, getModelSpec, type ModelSpec } from "@/shared/constants/modelSpecs";
+import {
+  MODEL_SPECS,
+  getAuthoritativeContextWindow,
+  getAuthoritativeProviderContextWindow,
+  getModelSpec,
+  type ModelSpec,
+} from "@/shared/constants/modelSpecs";
 import { getSyncedCapability } from "@/lib/modelsDevSync";
+import { getModelContextOverride } from "@/lib/db/modelContextOverrides";
+import { isVisionModelId } from "@/shared/constants/visionModels";
 
 const TOOL_CALLING_UNSUPPORTED_PATTERNS: string[] = [];
 const REASONING_UNSUPPORTED_PATTERNS = [
@@ -52,7 +60,7 @@ export interface ResolvedModelCapabilities {
   temperature: boolean | null;
   contextWindow: number | null;
   maxInputTokens: number | null;
-  maxOutputTokens: number;
+  maxOutputTokens: number | null;
   defaultThinkingBudget: number;
   thinkingBudgetCap: number | null;
   thinkingOverhead: number | null;
@@ -176,16 +184,138 @@ function getStaticSpec(modelId: string | null, rawModel: string | null): ModelSp
   return undefined;
 }
 
+function getAuthoritativeStaticContextWindow(
+  provider: string | null,
+  modelId: string | null,
+  rawModel: string | null
+): number | null {
+  for (const candidate of [modelId, rawModel]) {
+    const providerContextWindow = getAuthoritativeProviderContextWindow(provider, candidate);
+    if (typeof providerContextWindow === "number") return providerContextWindow;
+  }
+  for (const candidate of [modelId, rawModel]) {
+    const contextWindow = getAuthoritativeContextWindow(candidate);
+    if (typeof contextWindow === "number") return contextWindow;
+  }
+  return null;
+}
+
+function getStaticSpecCanonicalModelId(modelId: string | null, rawModel: string | null) {
+  const candidates = [modelId, rawModel].filter(
+    (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0
+  );
+  for (const candidate of candidates) {
+    const lower = candidate.toLowerCase();
+    for (const [canonical, spec] of Object.entries(MODEL_SPECS)) {
+      if (canonical === "__default__") continue;
+      if (canonical.toLowerCase() === lower) return canonical;
+      if (spec.aliases?.some((alias) => alias.toLowerCase() === lower)) return canonical;
+    }
+  }
+  return null;
+}
+
+/**
+ * Strip a trailing `-latest` alias suffix from a model id (#4073). Returns the
+ * short id (`pixtral-12b-latest` → `pixtral-12b`) or `null` when there is no
+ * `-latest` suffix to drop. Used only as a last-resort synced-lookup fallback.
+ */
+function stripLatestAlias(modelId: string | null): string | null {
+  if (!modelId) return null;
+  const stripped = modelId.replace(/-latest$/i, "");
+  return stripped && stripped !== modelId ? stripped : null;
+}
+
+function getSyncedCapabilityForResolved(
+  provider: string | null,
+  model: string | null,
+  rawModel: string | null
+): SyncedCapabilities {
+  if (!provider || !model) return null;
+
+  const direct = getSyncedCapability(provider, model);
+  if (direct) return direct;
+
+  if (rawModel && rawModel !== model) {
+    const raw = getSyncedCapability(provider, rawModel);
+    if (raw) return raw;
+  }
+
+  const canonical = getStaticSpecCanonicalModelId(model, rawModel);
+  if (canonical && canonical !== model) {
+    const byCanonical = getSyncedCapability(provider, canonical);
+    if (byCanonical) return byCanonical;
+  }
+
+  // #4073: models.dev catalogs some `-latest` aliases under their short id
+  // (e.g. Mistral `pixtral-12b-latest` is stored as `pixtral-12b`). When every
+  // exact lookup above misses, retry once with a trailing `-latest` stripped so
+  // the synced metadata (`attachment` / image modalities) still wins over the
+  // last-resort #4071 model-id heuristic. Only fires as a fallback, so models
+  // whose `-latest` id IS stored verbatim (e.g. `pixtral-large-latest`) keep
+  // resolving directly above.
+  for (const candidate of [model, rawModel]) {
+    const base = stripLatestAlias(candidate);
+    if (base && base !== model && base !== rawModel) {
+      const byAlias = getSyncedCapability(provider, base);
+      if (byAlias) return byAlias;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Last-resort vision fallback in resolveVisionCapability when there is no
+ * synced/registry/spec capability data (e.g. Mistral Pixtral, which ships no
+ * models.dev `attachment` flag and no registry `supportsVision`). Delegates to
+ * the single shared source (`@/shared/constants/visionModels`, #4072) so routing,
+ * the `/v1/models` listing and lite compression can never disagree on whether a
+ * model is vision-capable. The list is intentionally conservative — a false
+ * positive would let an image request route to a text-only model.
+ */
+export function modelIdLikelyVision(modelId: string | null | undefined): boolean {
+  return isVisionModelId(modelId);
+}
+
+/**
+ * Models that upstream catalogs (notably models.dev) mislabel as vision-capable but
+ * are TEXT-ONLY per the vendor's own docs. Listed here so a wrong synced
+ * `attachment:true` cannot route an image request to a blind model (the #4071 failure
+ * mode). Keep this list tiny and doc-backed.
+ *
+ * Xiaomi MiMo: only `mimo-v2.5` and `mimo-v2-omni` accept images; the `*-pro` chat
+ * models are text-only (mimo.mi.com .../image-understanding; hermes-agent#18884).
+ * Anchored to the full id (`$`) and tolerant of a `provider/` prefix so `mimo-v2.5-pro`
+ * never matches the multimodal `mimo-v2.5`, and `mimo-v2-pro` never matches `mimo-v2-omni`.
+ */
+const KNOWN_TEXT_ONLY_DESPITE_SYNC: readonly RegExp[] = [
+  /(?:^|\/)mimo-v2\.5-pro$/i,
+  /(?:^|\/)mimo-v2-pro$/i,
+];
+
+function isKnownTextOnlyDespiteSync(modelId: string | null | undefined): boolean {
+  if (!modelId) return false;
+  const id = String(modelId);
+  return KNOWN_TEXT_ONLY_DESPITE_SYNC.some((pattern) => pattern.test(id));
+}
+
 function resolveVisionCapability(
   spec: ModelSpec | undefined,
   registryModel: { supportsVision?: boolean } | null,
   synced: SyncedCapabilities,
   modalitiesInput: string[],
-  modalitiesOutput: string[]
+  modalitiesOutput: string[],
+  modelId?: string
 ): boolean | null {
   const allModalities = [...modalitiesInput, ...modalitiesOutput].map((entry) =>
     String(entry).toLowerCase()
   );
+
+  // Hard override FIRST: a wrong synced `attachment:true` (or image modality) must not
+  // win for models the vendor documents as text-only. Beats every branch below so an
+  // image request can never be routed to a blind model (#4071).
+  if (isKnownTextOnlyDespiteSync(modelId)) return false;
 
   if (typeof synced?.attachment === "boolean") {
     return synced.attachment;
@@ -195,8 +325,17 @@ function resolveVisionCapability(
     return true;
   }
 
+  if (allModalities.length > 0) {
+    return false;
+  }
+
   if (typeof registryModel?.supportsVision === "boolean") return registryModel.supportsVision;
   if (typeof spec?.supportsVision === "boolean") return spec.supportsVision;
+
+  // Last resort: no capability data at all. Positively confirm known multimodal
+  // families by model id so image requests can be routed to them; everything
+  // else stays `null` (unknown).
+  if (modelIdLikelyVision(modelId)) return true;
 
   return null;
 }
@@ -205,10 +344,11 @@ export function getResolvedModelCapabilities(input: CapabilityInput): ResolvedMo
   const resolved = resolveCapabilityInput(input);
   const spec = getStaticSpec(resolved.model, resolved.rawModel);
   const registryModel = getRegistryModel(resolved.provider, resolved.model);
-  const synced =
-    resolved.provider && resolved.model
-      ? getSyncedCapability(resolved.provider, resolved.model)
-      : null;
+  const synced = getSyncedCapabilityForResolved(
+    resolved.provider,
+    resolved.model,
+    resolved.rawModel
+  );
 
   const modalitiesInput = parseModalities(synced?.modalities_input);
   const modalitiesOutput = parseModalities(synced?.modalities_output);
@@ -233,7 +373,13 @@ export function getResolvedModelCapabilities(input: CapabilityInput): ResolvedMo
         : null) ??
       (typeof spec?.supportsThinking === "boolean" ? spec.supportsThinking : null));
 
+  const authoritativeContextWindow = getAuthoritativeStaticContextWindow(
+    resolved.provider,
+    resolved.model,
+    resolved.rawModel
+  );
   const contextWindow =
+    authoritativeContextWindow ??
     synced?.limit_context ??
     (typeof registryModel?.contextLength === "number" ? registryModel.contextLength : null) ??
     spec?.contextWindow ??
@@ -252,19 +398,24 @@ export function getResolvedModelCapabilities(input: CapabilityInput): ResolvedMo
       registryModel,
       synced,
       modalitiesInput,
-      modalitiesOutput
+      modalitiesOutput,
+      lookupKey
     ),
     supportsMaxTokens: heuristicMaxTokens(lookupKey),
     attachment: synced?.attachment ?? null,
     structuredOutput: synced?.structured_output ?? null,
     temperature: synced?.temperature ?? null,
     contextWindow,
-    maxInputTokens: synced?.limit_input ?? contextWindow,
+    maxInputTokens:
+      (typeof registryModel?.maxInputTokens === "number" ? registryModel.maxInputTokens : null) ??
+      authoritativeContextWindow ??
+      synced?.limit_input ??
+      contextWindow,
     maxOutputTokens:
       synced?.limit_output ??
       (typeof registryModel?.maxOutputTokens === "number" ? registryModel.maxOutputTokens : null) ??
       spec?.maxOutputTokens ??
-      MODEL_SPECS.__default__.maxOutputTokens,
+      null,
     defaultThinkingBudget: spec?.defaultThinkingBudget ?? 0,
     thinkingBudgetCap: spec?.thinkingBudgetCap ?? null,
     thinkingOverhead: spec?.thinkingOverhead ?? null,
@@ -277,7 +428,9 @@ export function getResolvedModelCapabilities(input: CapabilityInput): ResolvedMo
     lastUpdated: synced?.last_updated ?? null,
     modalitiesInput,
     modalitiesOutput,
-    interleavedField: synced?.interleaved_field ?? null,
+    interleavedField:
+      synced?.interleaved_field ??
+      (typeof registryModel?.interleavedField === "string" ? registryModel.interleavedField : null),
   };
 }
 
@@ -296,9 +449,11 @@ export function supportsMaxTokens(input: CapabilityInput): boolean {
   return getResolvedModelCapabilities(input).supportsMaxTokens;
 }
 
-export function capMaxOutputTokens(input: CapabilityInput, requested?: number): number {
+export function capMaxOutputTokens(input: CapabilityInput, requested?: number): number | null {
   const cap = getResolvedModelCapabilities(input).maxOutputTokens;
-  return requested ? Math.min(requested, cap) : cap;
+  const hasRequested = typeof requested === "number" && Number.isFinite(requested);
+  if (cap === null) return hasRequested ? requested : null;
+  return hasRequested ? Math.min(requested, cap) : cap;
 }
 
 export function getDefaultThinkingBudget(input: CapabilityInput): number {
@@ -318,5 +473,9 @@ export function getModelContextLimit(
     typeof providerOrInput === "string" && modelId !== undefined
       ? getResolvedModelCapabilities({ provider: providerOrInput, model: modelId })
       : getResolvedModelCapabilities(providerOrInput);
-  return resolved.contextWindow;
+  // Feature 5004: a persisted override (operator-set or auto-discovered) wins over the
+  // static catalog / models.dev sync. `getResolvedModelCapabilities` stays override-free
+  // so the reconciler can compare the catalog value against provider-declared windows.
+  const override = getModelContextOverride(resolved.provider, resolved.model);
+  return override ?? resolved.contextWindow;
 }

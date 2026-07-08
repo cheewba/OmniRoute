@@ -1,4 +1,5 @@
 import { CORS_HEADERS } from "./cors.ts";
+import { unwrapClinepassEnvelope } from "./clinepassEnvelope.ts";
 import { getDefaultErrorMessage, getErrorInfo } from "../config/errorConfig.ts";
 import { normalizePayloadForLog } from "@/lib/logPayloads";
 import type { ModelCooldownErrorPayload } from "@/types";
@@ -125,7 +126,7 @@ export function buildErrorBody(
  * @param {string} message - Error message
  * @returns {Response} HTTP Response object
  */
-export function errorResponse(statusCode, message) {
+export function errorResponse(statusCode: number, message: string): Response {
   return new Response(JSON.stringify(buildErrorBody(statusCode, sanitizeErrorMessage(message))), {
     status: statusCode,
     headers: {
@@ -140,7 +141,11 @@ export function errorResponse(statusCode, message) {
  * @param {number} statusCode - HTTP status code
  * @param {string} message - Error message
  */
-export async function writeStreamError(writer, statusCode, message) {
+export async function writeStreamError(
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  statusCode: number,
+  message: string
+): Promise<void> {
   const errorBody = buildErrorBody(statusCode, sanitizeErrorMessage(message));
   const encoder = new TextEncoder();
   await writer.write(encoder.encode(`data: ${JSON.stringify(errorBody)}\n\n`));
@@ -174,7 +179,7 @@ function normalizeRetryAfterSeconds(retryAfter?: string | number | Date | null):
  * @param {string} message - Error message
  * @returns {number|null} Retry time in milliseconds, or null if not found
  */
-export function parseAntigravityRetryTime(message) {
+export function parseAntigravityRetryTime(message: unknown): number | null {
   if (typeof message !== "string") return null;
 
   // Match patterns like: 2h7m23s, 5m30s, 45s, 1h20m, etc.
@@ -210,12 +215,12 @@ export function parseAntigravityRetryTime(message) {
  * @param {string} provider - Provider name (for Antigravity-specific parsing)
  * @returns {Promise<{statusCode: number, message: string, retryAfterMs: number|null, responseBody: unknown}>}
  */
-export async function parseUpstreamError(response, provider = null) {
-  let message = "";
+export async function parseUpstreamError(response: Response, provider: string | null = null) {
+  let message: unknown = "";
   let retryAfterMs: number | null = null;
   let responseBody: unknown = null;
-  let errorCode = undefined;
-  let errorType = undefined;
+  let errorCode: unknown = undefined;
+  let errorType: unknown = undefined;
 
   try {
     const text = await response.text();
@@ -223,8 +228,17 @@ export async function parseUpstreamError(response, provider = null) {
 
     // Try parse as JSON
     try {
-      const json = JSON.parse(text);
-      message = json.error?.message || json.message || json.error || text;
+      const parsed = JSON.parse(text);
+      // Handle array responses (e.g., from some Gemini APIs)
+      const json = (Array.isArray(parsed) && parsed.length > 0 ? parsed[0] : parsed) || {};
+      // ClinePass wraps upstream errors in a {success:false, error} envelope.
+      // Extract the upstream error string (an upstream JSON field, not a local
+      // stack) — still routed through sanitizeErrorMessage/buildErrorBody by
+      // every consumer below (Rule #12).
+      const { error: clinepassEnvError } = unwrapClinepassEnvelope(json, provider);
+      message = clinepassEnvError
+        ? clinepassEnvError.message
+        : json.error?.message || json.message || json.error || text;
       errorCode = json.error?.code || json.code;
       errorType = json.error?.type || json.type;
     } catch {
@@ -439,6 +453,40 @@ export function modelCooldownResponse({
 }
 
 /**
+ * Build an executor-style error result (response + url + headers + transformedBody).
+ * Shared by web-cookie executors that return the `{ response, url, headers, transformedBody }` shape.
+ */
+export function makeExecutorErrorResult(
+  status: number,
+  message: string,
+  body: unknown,
+  url: string
+) {
+  return {
+    response: new Response(
+      JSON.stringify({
+        error: {
+          message: sanitizeErrorMessage(message),
+          type: "upstream_error",
+          code: `HTTP_${status}`,
+        },
+      }),
+      { status, headers: { "Content-Type": "application/json" } }
+    ),
+    url,
+    headers: {} as Record<string, string>,
+    transformedBody: body,
+  };
+}
+
+/**
+ * Normalize a cookie string: strip a leading "Cookie:" prefix if present.
+ */
+export function normalizeCookie(raw: string): string {
+  return raw?.startsWith("Cookie:") ? raw.slice(7).trim() : raw || "";
+}
+
+/**
  * Format provider error with context
  * @param {Error} error - Original error
  * @param {string} provider - Provider name
@@ -446,8 +494,22 @@ export function modelCooldownResponse({
  * @param {number|string} statusCode - HTTP status code or error code
  * @returns {string} Formatted error message
  */
-export function formatProviderError(error, provider, model, statusCode) {
-  const code = statusCode || error.code || "FETCH_FAILED";
+export function formatProviderError(
+  error: { code?: string | number; message?: string; cause?: unknown } | Error,
+  provider: string,
+  model: string,
+  statusCode?: string | number | null
+): string {
+  const providerCode = "code" in error ? error.code : undefined;
+  const code = statusCode || providerCode || "FETCH_FAILED";
   const message = error.message || "Unknown error";
-  return `[${code}]: ${message}`;
+  // Expose low-level cause (e.g. UND_ERR_SOCKET, ECONNRESET, ETIMEDOUT) for diagnosing fetch failures
+  const cause = (error as { cause?: unknown }).cause;
+  const causeObj =
+    cause && typeof cause === "object" ? (cause as Record<string, unknown>) : undefined;
+  const causeCode = typeof causeObj?.code === "string" ? causeObj.code : undefined;
+  const causeMsg = typeof causeObj?.message === "string" ? causeObj.message : undefined;
+  const causeStr =
+    causeCode || causeMsg ? ` (cause: ${[causeCode, causeMsg].filter(Boolean).join(": ")})` : "";
+  return `[${code}]: ${message}${causeStr}`;
 }

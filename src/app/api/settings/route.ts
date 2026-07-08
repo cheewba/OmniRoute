@@ -4,7 +4,14 @@ import { getRuntimePorts } from "@/lib/runtime/ports";
 import { updateSettingsSchema } from "@/shared/validation/settingsSchemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
-import { validateProxyUrl, upsertUpstreamProxyConfig } from "@/lib/db/upstreamProxy";
+import { resolveModelLockoutSettings } from "@/lib/resilience/modelLockoutSettings";
+import {
+  validateProxyUrl,
+  upsertUpstreamProxyConfig,
+  getUpstreamProxyConfig,
+} from "@/lib/db/upstreamProxy";
+import { getProviderConnections } from "@/lib/db/providers";
+import { clearCliproxyapiUrlCache } from "@omniroute/open-sse/executors/cliproxyapi.ts";
 import {
   ensurePersistentManagementPasswordHash,
   getStoredManagementPassword,
@@ -18,6 +25,19 @@ import { isDashboardSessionAuthenticated } from "@/shared/utils/apiAuth";
 import { isCliTokenAuthValid } from "@/lib/middleware/cliTokenAuth";
 import { extractApiKey } from "@/sse/services/auth";
 import { getApiKeyMetadata } from "@/lib/db/apiKeys";
+
+/**
+ * Force this route to run dynamically per-request and never be cached/prerendered.
+ * Combined with the `Cache-Control: no-store` response header below, this keeps
+ * persisted settings (e.g. dashboard preferences, debugMode, hidden sidebar
+ * items) visible immediately after refresh or restart instead of falling back
+ * to stale Next.js fetch cache. Ported from upstream decolua/9router#951.
+ */
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+/** Response headers applied to every successful GET/PATCH on /api/settings. */
+const SETTINGS_RESPONSE_HEADERS = { "Cache-Control": "no-store" } as const;
 
 /**
  * Settings keys whose change broadens attack surface. Spec §Security:
@@ -144,16 +164,33 @@ export async function GET(request: Request) {
     const cloudUrl = process.env.CLOUD_URL || process.env.NEXT_PUBLIC_CLOUD_URL || null;
     const machineId = await getConsistentMachineId();
 
-    return NextResponse.json({
-      ...safeSettings,
-      hasPassword: hasManagementPasswordConfigured(settings),
-      runtimePorts,
-      apiPort: runtimePorts.apiPort,
-      dashboardPort: runtimePorts.dashboardPort,
-      cloudConfigured: Boolean(cloudUrl),
-      cloudUrl,
-      machineId,
-    });
+    // Include cliproxyapi_model_mapping from upstream_proxy_config table
+    let cliproxyapiModelMapping: Record<string, string> | null = null;
+    try {
+      const proxyConfig = await getUpstreamProxyConfig("cliproxyapi");
+      if (proxyConfig?.cliproxyapiModelMapping) {
+        cliproxyapiModelMapping = proxyConfig.cliproxyapiModelMapping as Record<string, string>;
+      }
+    } catch {
+      // best effort — don't fail GET /api/settings if this lookup fails
+    }
+
+    return NextResponse.json(
+      {
+        ...safeSettings,
+        hasPassword: hasManagementPasswordConfigured(settings),
+        runtimePorts,
+        apiPort: runtimePorts.apiPort,
+        dashboardPort: runtimePorts.dashboardPort,
+        cloudConfigured: Boolean(cloudUrl),
+        cloudUrl,
+        machineId,
+        ...(cliproxyapiModelMapping !== null
+          ? { cliproxyapi_model_mapping: cliproxyapiModelMapping }
+          : {}),
+      },
+      { headers: SETTINGS_RESPONSE_HEADERS }
+    );
   } catch (error) {
     console.log("Error getting settings:", error);
     return NextResponse.json({ error: "Failed to load settings" }, { status: 500 });
@@ -199,6 +236,14 @@ export async function PATCH(request: Request) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
     const body: typeof validation.data & { password?: string } = { ...validation.data };
+
+    // Sanitize model lockout settings: clamp values to valid bounds so that
+    // stale DB values or hand-crafted requests don't bypass range validation.
+    if (body.modelLockout) {
+      body.modelLockout = resolveModelLockoutSettings({
+        modelLockout: body.modelLockout as Record<string, unknown>,
+      }) as typeof body.modelLockout;
+    }
 
     // Security-impacting gate (T-011, spec AC-4 / AC-5). Computed from the
     // VALIDATED body so we never trip on stray unknown keys. If any security
@@ -277,16 +322,49 @@ export async function PATCH(request: Request) {
           { status: 400 }
         );
       }
+      // Invalidate the executor's URL cache so it picks up the new URL immediately
+      clearCliproxyapiUrlCache();
     }
 
-    if (cpaFallback !== undefined || cpaUrl !== undefined) {
+    const cpaModelMapping = rawBody.cliproxyapi_model_mapping as Record<string, string> | undefined;
+
+    if (cpaFallback !== undefined || cpaUrl !== undefined || cpaModelMapping !== undefined) {
       const enabled =
         cpaFallback ?? (settings as Record<string, unknown>).cliproxyapi_fallback_enabled;
       const mode = enabled ? "fallback" : "native";
+
+      // Get all distinct active provider IDs so each one gets its own
+      // upstream_proxy_config row. chatCore reads per-provider config
+      // (e.g. getUpstreamProxyConfig("anthropic")), not a single global row.
+      // Embedded service IDs are not real routing targets and must be skipped.
+      const EMBEDDED_SERVICE_IDS = new Set(["cliproxyapi", "9router"]);
+      const activeConnections = await getProviderConnections({ isActive: true });
+      const activeProviderIds = [
+        ...new Set(
+          activeConnections
+            .map((c: Record<string, unknown>) => c.provider as string)
+            .filter((id: string) => !EMBEDDED_SERVICE_IDS.has(id))
+        ),
+      ];
+
+      for (const providerId of activeProviderIds) {
+        await upsertUpstreamProxyConfig({
+          providerId,
+          mode,
+          enabled: !!enabled,
+          ...(cpaModelMapping !== undefined ? { cliproxyapiModelMapping: cpaModelMapping } : {}),
+        });
+      }
+
+      // Update the "cliproxyapi" sentinel row used by GET /api/settings to
+      // retrieve cliproxyapi_model_mapping. This row is NOT used for routing
+      // (chatCore reads per-real-provider rows above); it exists solely as
+      // storage for the global model-mapping blob.
       await upsertUpstreamProxyConfig({
         providerId: "cliproxyapi",
         mode,
         enabled: !!enabled,
+        ...(cpaModelMapping !== undefined ? { cliproxyapiModelMapping: cpaModelMapping } : {}),
       });
     }
 
@@ -314,7 +392,7 @@ export async function PATCH(request: Request) {
     }
 
     const { password, ...safeSettings } = settings;
-    return NextResponse.json(safeSettings);
+    return NextResponse.json(safeSettings, { headers: SETTINGS_RESPONSE_HEADERS });
   } catch (error) {
     console.log("Error updating settings:", error);
     return NextResponse.json({ error: "Failed to update settings" }, { status: 500 });

@@ -16,7 +16,6 @@
 import {
   normalizeRequestBodyLimitMb,
   parseRequestBodyLimitBytes,
-  requestBodyLimitBytesToMb,
   requestBodyLimitMbToBytes,
 } from "../constants/bodySize";
 
@@ -26,6 +25,12 @@ export const MAX_BODY_BYTES_IMPORT = 100 * 1024 * 1024;
 /** Larger limit for audio transcription uploads: 100 MB */
 export const MAX_BODY_BYTES_AUDIO = 100 * 1024 * 1024;
 
+/** Larger limit for file uploads: 500 MB */
+export const MAX_BODY_BYTES_FILE = 500 * 1024 * 1024;
+
+/** Larger limit for LLM request payloads: 50 MB */
+export const MAX_BODY_BYTES_LLM_API = 50 * 1024 * 1024;
+
 /** Configured limit — reads from env or falls back to 10 MB */
 export const MAX_BODY_BYTES = parseRequestBodyLimitBytes(process.env.MAX_BODY_SIZE_BYTES);
 
@@ -33,12 +38,11 @@ type BodySizeRule = { prefix: string; limit: number };
 
 const ROUTE_LIMITS: BodySizeRule[] = [
   { prefix: "/api/db-backups/import", limit: MAX_BODY_BYTES_IMPORT },
+  { prefix: "/api/v1/chat/completions", limit: MAX_BODY_BYTES_LLM_API },
+  { prefix: "/api/v1/responses", limit: MAX_BODY_BYTES_LLM_API },
   { prefix: "/api/v1/audio/transcriptions", limit: MAX_BODY_BYTES_AUDIO },
+  { prefix: "/api/v1/files", limit: MAX_BODY_BYTES_FILE },
 ];
-
-export function getDefaultRequestBodyLimitMb(): number {
-  return requestBodyLimitBytesToMb(MAX_BODY_BYTES);
-}
 
 export function getConfiguredBodySizeLimitBytes(settings?: Record<string, unknown>): number {
   const configuredMb = normalizeRequestBodyLimitMb(settings?.maxBodySizeMb);
@@ -62,7 +66,7 @@ export function checkBodySize(request: Request, limit: number = MAX_BODY_BYTES):
   const contentLength = request.headers.get("content-length");
 
   if (contentLength) {
-    const bytes = parseInt(contentLength, 10);
+    const bytes = Number.parseInt(contentLength, 10);
     if (!Number.isNaN(bytes) && bytes > limit) {
       return new Response(
         JSON.stringify({

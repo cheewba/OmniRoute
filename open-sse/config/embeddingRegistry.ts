@@ -8,12 +8,25 @@
  * keyed by provider ID (e.g. "nebius", "openai").
  */
 
+export interface EmbeddingModel {
+  id: string;
+  name: string;
+  dimensions?: number;
+  /**
+   * Model-level default request parameters injected into the upstream body when
+   * the client did not already supply them. Used for asymmetric embedding models
+   * that require a mandatory parameter — e.g. NVIDIA NIM `nv-embedqa-*` models
+   * reject requests without `input_type` ("query" | "passage"). See issue #1378.
+   */
+  defaultParams?: Record<string, unknown>;
+}
+
 export interface EmbeddingProvider {
   id: string;
   baseUrl: string;
   authType: string;
   authHeader: string;
-  models: { id: string; name: string; dimensions?: number }[];
+  models: EmbeddingModel[];
 }
 
 export interface EmbeddingProviderNodeRow {
@@ -80,6 +93,17 @@ export const EMBEDDING_PROVIDERS: Record<string, EmbeddingProvider> = {
     ],
   },
 
+  "vercel-ai-gateway": {
+    id: "vercel-ai-gateway",
+    baseUrl: "https://ai-gateway.vercel.sh/v1/embeddings",
+    authType: "apikey",
+    authHeader: "bearer",
+    models: [
+      { id: "text-embedding-3-small", name: "Text Embedding 3 Small", dimensions: 1536 },
+      { id: "text-embedding-3-large", name: "Text Embedding 3 Large", dimensions: 3072 },
+    ],
+  },
+
   upstage: {
     id: "upstage",
     baseUrl: "https://api.upstage.ai/v1/embeddings",
@@ -130,7 +154,17 @@ export const EMBEDDING_PROVIDERS: Record<string, EmbeddingProvider> = {
     baseUrl: "https://integrate.api.nvidia.com/v1/embeddings",
     authType: "apikey",
     authHeader: "bearer",
-    models: [{ id: "nvidia/nv-embedqa-e5-v5", name: "NV EmbedQA E5 v5", dimensions: 1024 }],
+    // nv-embedqa-* are asymmetric models: NVIDIA NIM rejects requests without an
+    // `input_type` ("query" | "passage") with 400 "'input_type' parameter is
+    // required". Default to "query" when the client omits it (issue #1378).
+    models: [
+      {
+        id: "nvidia/nv-embedqa-e5-v5",
+        name: "NV EmbedQA E5 v5",
+        dimensions: 1024,
+        defaultParams: { input_type: "query" },
+      },
+    ],
   },
 
   // Issue #2298: Adding DeepInfra to the embedding registry so custom
@@ -182,7 +216,10 @@ export const EMBEDDING_PROVIDERS: Record<string, EmbeddingProvider> = {
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/embeddings",
     authType: "apikey",
     authHeader: "bearer",
-    models: [{ id: "text-embedding-004", name: "Text Embedding 004", dimensions: 768 }],
+    models: [
+      { id: "gemini-embedding-2", name: "Gemini Embedding 2", dimensions: 768 },
+      { id: "gemini-embedding-001", name: "Gemini Embedding 001", dimensions: 768 },
+    ],
   },
 
   "voyage-ai": {
@@ -194,6 +231,7 @@ export const EMBEDDING_PROVIDERS: Record<string, EmbeddingProvider> = {
       { id: "voyage-4-large", name: "Voyage 4 Large", dimensions: 1024 },
       { id: "voyage-4", name: "Voyage 4", dimensions: 1024 },
       { id: "voyage-4-lite", name: "Voyage 4 Lite", dimensions: 1024 },
+      { id: "voyage-3-large", name: "Voyage 3 Large", dimensions: 1024 },
       { id: "voyage-multilingual-3.5", name: "Voyage Multilingual 3.5", dimensions: 1024 },
       { id: "voyage-code-3", name: "Voyage Code 3", dimensions: 1024 },
       { id: "voyage-code-2", name: "Voyage Code 2", dimensions: 1536 },
@@ -321,6 +359,55 @@ export function parseEmbeddingModel(
   }
 
   return { provider: null, model: modelStr };
+}
+
+/**
+ * Resolve the known vector dimension of an embedding model string
+ * (format: "provider/model"). Returns undefined when the provider/model is
+ * unknown or the registry has no dimension recorded for it (e.g. local/custom
+ * providers) — callers treat undefined as "can't assert", not "zero".
+ */
+export function getEmbeddingDimension(modelStr: string): number | undefined {
+  const { provider, model } = parseEmbeddingModel(modelStr);
+  if (!provider || !model) return undefined;
+  const config = getEmbeddingProvider(provider);
+  if (!config) return undefined;
+  return config.models.find((m) => m.id === model)?.dimensions;
+}
+
+/**
+ * Detect whether a set of embedding model strings spans more than one known
+ * vector dimension. Vectors from models of different dimensions live in
+ * incompatible spaces, so failing over between them silently corrupts any
+ * vector store built on top of the proxy. Models with an *unknown* dimension
+ * are ignored (conservative: we never flag a conflict we can't prove).
+ */
+export function detectEmbeddingDimensionConflict(modelStrs: string[]): {
+  conflict: boolean;
+  dimensions: Record<string, number>;
+  distinct: number[];
+} {
+  const dimensions: Record<string, number> = {};
+  for (const modelStr of modelStrs) {
+    const dim = getEmbeddingDimension(modelStr);
+    if (typeof dim === "number") dimensions[modelStr] = dim;
+  }
+  const distinct = [...new Set(Object.values(dimensions))].sort((a, b) => a - b);
+  return { conflict: distinct.length > 1, dimensions, distinct };
+}
+
+/**
+ * Resolve the model-level default request params for a given provider config and
+ * model id. Returns undefined when the model has no defaults (the common case),
+ * so callers only inject for models that actually carry one (e.g. NVIDIA NIM
+ * asymmetric embedders requiring `input_type`). See issue #1378.
+ */
+export function getEmbeddingModelDefaultParams(
+  providerConfig: EmbeddingProvider | null,
+  modelId: string | null
+): Record<string, unknown> | undefined {
+  if (!providerConfig || !modelId) return undefined;
+  return providerConfig.models.find((m) => m.id === modelId)?.defaultParams;
 }
 
 /**

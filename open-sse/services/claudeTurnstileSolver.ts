@@ -84,9 +84,9 @@ export async function solveTurnstile(options?: {
     browser = await chromium.launch({ headless });
     const context = await browser.newContext({
       userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       viewport: { width: 1280, height: 720 },
-      ignoreHTTPSErrors: true,
+      ignoreHTTPSErrors: process.env.OMNIROUTE_TURNSTILE_IGNORE_TLS_ERRORS === "true",
     });
 
     page = await context.newPage();
@@ -134,6 +134,12 @@ const tokenCache = new Map<
   }
 >();
 
+let cfClearanceTokenOverride: string | null = null;
+
+export function setCfClearanceTokenForTesting(token: string | null): void {
+  cfClearanceTokenOverride = token;
+}
+
 /**
  * Get or solve cf_clearance (with caching)
  */
@@ -143,6 +149,14 @@ export async function getCfClearanceToken(options?: {
 }): Promise<string> {
   const cacheKey = "claude-cf-clearance";
   const cached = tokenCache.get(cacheKey);
+
+  if (cfClearanceTokenOverride) {
+    tokenCache.set(cacheKey, {
+      token: cfClearanceTokenOverride,
+      expiresAt: Date.now() + 55 * 60 * 1000,
+    });
+    return cfClearanceTokenOverride;
+  }
 
   // Return cached token if still valid (5 min buffer)
   if (cached && !options?.force && cached.expiresAt > Date.now() + 5 * 60 * 1000) {

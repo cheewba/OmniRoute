@@ -209,10 +209,25 @@ export function getLastSessionModel(sessionId: string, comboName: string): strin
       `SELECT model_str
        FROM session_model_history
        WHERE session_id = ? AND combo_name = ?
-       ORDER BY used_at DESC
+       ORDER BY used_at DESC, id DESC
        LIMIT 1`
     )
     .get(sessionId, comboName) as { model_str: string } | undefined;
 
   return row?.model_str ?? null;
+}
+
+/**
+ * Clear all session model history entries for a given combo name.
+ * Called when a combo's model targets are changed to invalidate stale context-cache pins.
+ *
+ * @param comboName - The combo name whose pins should be cleared.
+ * @returns The number of deleted entries.
+ */
+export function clearSessionModelHistoryForCombo(comboName: string): number {
+  const db = getDbInstance() as unknown as DbLike;
+  const result = db
+    .prepare("DELETE FROM session_model_history WHERE combo_name = ?")
+    .run(comboName);
+  return result.changes ?? 0;
 }

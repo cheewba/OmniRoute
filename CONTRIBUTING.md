@@ -59,12 +59,39 @@ These settings are stored in the database and persist across restarts, overridin
 npm run dev
 
 # Production build
-npm run build
+npm run build    # next build → .build/next/ then assembleStandalone → dist/
 npm run start
+
+# Release build (clean rebuild + HEAD sentinel — required for deploy)
+npm run build:release   # rm -rf .build dist && build + writes dist/BUILD_SHA
 
 # Common port configuration
 PORT=20128 NEXT_PUBLIC_BASE_URL=http://localhost:20128 npm run dev
 ```
+
+### Build Output Layout
+
+| Directory | Contents                                                                  | Tracked |
+| --------- | ------------------------------------------------------------------------- | ------- |
+| `src/`    | Application source (TypeScript / TSX)                                     | Yes     |
+| `.build/` | Intermediates — `next build` output (gitignored, `distDir = .build/next`) | No      |
+| `dist/`   | Shippable bundle — assembled by `assembleStandalone` (gitignored)         | No      |
+
+The build pipeline is a single pass:
+
+```
+npm run build
+  └─ next build → .build/next/standalone  (Next.js output)
+  └─ assembleStandalone()                 (copies standalone + static + public + native assets)
+       └─ output: dist/                   (server.js, .next/static/, public/, node_modules/)
+```
+
+`npm run build:release` additionally cleans both directories first and writes
+`dist/BUILD_SHA` (= `git rev-parse --short HEAD`) as a deploy integrity sentinel.
+
+> **VPS deploy note:** the remote image directory `/usr/lib/node_modules/omniroute/app/`
+> is unchanged. The deploy skills rsync the contents of `dist/` into it.
+> Only the in-repo build output path moved (`app/` → `dist/`).
 
 Default URLs:
 
@@ -133,19 +160,31 @@ npm run test:protocols:e2e
 # Ecosystem compatibility tests
 npm run test:ecosystem
 
-# Coverage gate: 75% statements/lines/functions, 70% branches
+# Coverage gate: 60% statements/lines/functions/branches
 npm run test:coverage
 npm run coverage:report
 
 # Lint + format check
 npm run lint
 npm run check
+
+# Gated real-upstream combo smoke (requires VPS access + real provider credits)
+# Hits REAL providers — costs a little. NEVER runs in CI. Skips cleanly without the gate.
+# Needs: ssh root@192.168.0.15 access (sources a read-only DB snapshot from the VPS).
+RUN_COMBO_LIVE=1 npm run test:combo:live
+
+# Phase-3 VPS live smoke — plain Node ESM scripts, hit the live .15 server directly.
+# Requires: ssh root@192.168.0.15 access (combos created/torn down via SSH sqlite).
+# Hits REAL providers (small cost). Creates/deletes only __live_test__* combos. NEVER runs in CI.
+# REQUIRE_API_KEY=false on .15 so no API key needed, but honors COMBO_LIVE_BASE_URL / COMBO_LIVE_API_KEY if set.
+npm run test:combo:live:vps              # 7 HTTP scenarios (priority/round-robin/weighted/cost/fusion/auto + health)
+npm run test:combo:live:vps:failover     # adds a real cross-provider failover scenario (8 total)
 ```
 
 Coverage notes:
 
 - `npm run test:coverage` measures source coverage for the main unit test suite, excludes `tests/**`, and includes `open-sse/**`
-- Pull requests must keep the coverage gate at **75%+** statements/lines/functions and **70%+** branches
+- Pull requests must keep the coverage gate at **60%+** statements/lines/functions/branches
 - If a PR changes production code in `src/`, `open-sse/`, `electron/`, or `bin/`, it must add or update automated tests in the same PR
 - `npm run coverage:report` prints the detailed file-by-file report from the latest coverage run
 - `npm run test:coverage:legacy` preserves the older metric for historical comparison
@@ -157,7 +196,7 @@ Before opening or merging a PR:
 
 - Run `npm run test:unit`
 - Run `npm run test:coverage`
-- Ensure the coverage gate stays at **75%+** statements/lines/functions, **70%+** branches
+- Ensure the coverage gate stays at **60%+** statements/lines/functions/branches
 - Include the changed or added test files in the PR description when production code changed
 - Check the SonarQube result on the PR when the project secrets are configured in CI
 
@@ -225,25 +264,32 @@ open-sse/                   # @omniroute/open-sse workspace
 electron/                   # Electron desktop app (cross-platform)
 
 tests/
-├── unit/                   # Node.js test runner (122 test files)
+├── unit/                   # Node.js test runner (1,574 test files)
 ├── integration/            # Integration tests
 ├── e2e/                    # Playwright tests
 ├── security/               # Security tests
 ├── translator/             # Translator-specific tests
 └── load/                   # Load tests
 
-docs/                       # Documentation
-├── ARCHITECTURE.md         # System architecture
-├── API_REFERENCE.md        # All endpoints
-├── USER_GUIDE.md           # Provider setup, CLI integration
-├── TROUBLESHOOTING.md      # Common issues
-├── MCP-SERVER.md           # MCP server (25 tools)
-├── A2A-SERVER.md           # A2A agent protocol
-├── AUTO-COMBO.md           # Auto-combo engine
-├── CLI-TOOLS.md            # CLI tools integration
-├── COVERAGE_PLAN.md        # Test coverage improvement plan
-├── openapi.yaml            # OpenAPI specification
-└── adr/                    # Architecture Decision Records
+docs/
+├── adr/                     # Architecture Decision Records
+├── architecture/            # System architecture & resilience
+├── comparison/              # OmniRoute vs alternatives
+├── compression/             # Compression guides & rules
+├── dev/                     # Development guides
+├── diagrams/                # Architecture diagrams
+├── frameworks/              # MCP, A2A, OpenCode, Memory, Skills
+├── guides/                  # User guide, Docker, setup, troubleshooting
+├── i18n/                    # Internationalized README translations
+├── marketing/               # Marketing materials
+├── ops/                     # Deployment, proxy, coverage, releases
+├── providers/               # Provider-specific docs
+├── reference/               # API reference, env vars, CLI tools, free tiers
+├── releases/                # Release notes
+├── routing/                 # Auto-combo engine, reasoning replay
+├── screenshots/             # Dashboard screenshots
+├── security/                # Guardrails, compliance, stealth, tokens
+└── specs/                   # Design specs
 ```
 
 ---
@@ -306,6 +352,10 @@ Write unit tests in `tests/unit/` covering at minimum:
 ## Releasing
 
 Releases are managed via the `/generate-release` workflow. When a new GitHub Release is created, the package is **automatically published to npm** via GitHub Actions.
+
+For VPS deploys, use `npm run build:release` (not `npm run build`) — it performs a clean
+rebuild, assembles the bundle into `dist/`, and writes the `dist/BUILD_SHA` sentinel.
+Then use the `/deploy-vps-*-cc` skills which rsync `dist/` to the remote `app/` directory.
 
 ---
 

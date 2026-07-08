@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getProviderConnectionById } from "@/models";
 import { getSyncedAvailableModelsForConnection } from "@/lib/db/models";
+import { selectModelsForImport } from "@/shared/utils/freeModels";
 import {
   importManagedModels,
   type ManagedModelImportMode,
@@ -11,7 +12,11 @@ import {
   buildModelSyncInternalHeaders,
   isModelSyncInternalRequest,
 } from "@/shared/services/modelSyncScheduler";
+import { autoSyncCodexProfilesFromLiveCatalog } from "@/lib/cli-helper/codexProfileAutoSync";
+import { autoSyncClaudeProfilesFromLiveCatalog } from "@/lib/cli-helper/claudeProfileAutoSync";
 import { GET as getProviderModels } from "../models/route";
+import { isDegradedLocalCatalog } from "./degradedLocalCatalog";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -173,7 +178,7 @@ export type EnsureReadyOptions = {
 };
 
 export async function ensureLoopbackServerReady(opts: EnsureReadyOptions = {}): Promise<void> {
-  if (__loopbackReadyPromise) return __loopbackReadyPromise;
+  if (__loopbackReadyPromise != null) return __loopbackReadyPromise;
   __loopbackReadyPromise = (async () => {
     const f = opts.fetch ?? fetch;
     const maxWaitMs = opts.maxWaitMs ?? 30_000;
@@ -438,7 +443,49 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       );
     }
 
-    const fetchedModels = modelsData.models || [];
+    const modelSource = toNonEmptyString(modelsData.source)?.toLowerCase() || "unknown";
+    const modelWarning = toNonEmptyString(modelsData.warning);
+    if (isDegradedLocalCatalog(modelsData)) {
+      const responseError =
+        modelWarning || "Remote model discovery failed; local catalog fallback not synced";
+      await saveCallLog({
+        method: "GET",
+        path: `/api/providers/${id}/models`,
+        status: 502,
+        model: "model-sync",
+        provider: logProvider,
+        sourceFormat: "-",
+        connectionId: id,
+        duration,
+        error: responseError,
+        requestType: "model-sync",
+        responseBody: {
+          source: modelSource,
+          warning: modelWarning,
+          provider: logProvider,
+          channel: channelLabel,
+        },
+      });
+
+      return NextResponse.json(
+        {
+          error: responseError,
+          source: modelSource,
+          ...(modelWarning ? { warning: modelWarning } : {}),
+        },
+        { status: 502 }
+      );
+    }
+
+    const allFetchedModels = modelsData.models || [];
+    const importFreeOnly = Boolean(
+      (connection.providerSpecificData as Record<string, unknown> | undefined)?.importFreeModelsOnly
+    );
+    const { models: fetchedModels, freeFilterEmpty } = selectModelsForImport(
+      logProvider,
+      allFetchedModels,
+      importFreeOnly
+    );
     const {
       previousModels,
       previousSyncedAvailableModels,
@@ -477,6 +524,46 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const shouldLog = modelChanges.total > 0 || customModelChanges.total > 0;
 
     if (shouldLog) {
+      void autoSyncCodexProfilesFromLiveCatalog(request, `model-sync:${logProvider}`)
+        .then((syncResult) => {
+          if (syncResult.ok) {
+            console.log(
+              `[ModelSync] Codex profile auto-sync wrote ${syncResult.written} profile(s), skipped ${syncResult.skipped} (${logProvider})`
+            );
+          } else {
+            console.log(
+              `[ModelSync] Codex profile auto-sync skipped for ${logProvider}: ${syncResult.reason}`
+            );
+          }
+        })
+        .catch((err) => {
+          console.log(
+            `[ModelSync] Codex profile auto-sync failed for ${logProvider}:`,
+            err?.message || err
+          );
+        });
+
+      void autoSyncClaudeProfilesFromLiveCatalog(request, `model-sync:${logProvider}`)
+        .then((syncResult) => {
+          if (syncResult.ok) {
+            console.log(
+              `[ModelSync] Claude profile auto-sync wrote ${syncResult.written} profile(s), skipped ${syncResult.skipped} (${logProvider})`
+            );
+          } else {
+            console.log(
+              `[ModelSync] Claude profile auto-sync skipped for ${logProvider}: ${syncResult.reason}`
+            );
+          }
+        })
+        .catch((err) => {
+          console.log(
+            `[ModelSync] Claude profile auto-sync failed for ${logProvider}:`,
+            err?.message || err
+          );
+        });
+    }
+
+    if (shouldLog) {
       await saveCallLog({
         method: "GET",
         path: `/api/providers/${id}/models`,
@@ -506,6 +593,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       ok: true,
       provider: logProvider,
       mode,
+      importFreeOnly,
+      freeFilterEmpty,
       syncedModels: syncedModelsCount,
       availableModelsCount,
       syncedAliases,
@@ -540,6 +629,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         : {}),
     }).catch(() => {});
 
-    return NextResponse.json({ error: error.message || "Failed to sync models" }, { status: 500 });
+    return NextResponse.json(
+      { error: sanitizeErrorMessage(error) || "Failed to sync models" },
+      { status: 500 }
+    );
   }
 }

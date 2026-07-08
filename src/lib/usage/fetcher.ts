@@ -2,7 +2,6 @@
  * Usage Fetcher - Get usage data from provider APIs
  */
 
-import { GEMINI_CONFIG } from "@/lib/oauth/constants/oauth";
 import {
   getGitHubCopilotInternalUserHeaders,
   getKiroServiceHeaders,
@@ -34,9 +33,8 @@ export async function getUsageForProvider(connection) {
   switch (provider) {
     case "github":
       return await getGitHubUsage(accessToken, providerSpecificData);
-    case "gemini-cli":
-      return await getGeminiUsage(accessToken);
     case "antigravity":
+    case "agy":
       return await getAntigravityUsage(
         accessToken,
         providerSpecificData,
@@ -132,36 +130,6 @@ function formatGitHubQuotaSnapshot(quota) {
     remaining: quota.remaining,
     unlimited: quota.unlimited || false,
   };
-}
-
-/**
- * Gemini CLI Usage (Google Cloud)
- */
-async function getGeminiUsage(accessToken) {
-  try {
-    // Gemini CLI uses Google Cloud quotas
-    // Try to get quota info from Cloud Resource Manager
-    const response = await fetch(
-      "https://cloudresourcemanager.googleapis.com/v1/projects?filter=lifecycleState:ACTIVE",
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: "application/json",
-        },
-      }
-    );
-
-    if (!response.ok) {
-      // Quota API may not be accessible, return generic message
-      return {
-        message: "Gemini CLI uses Google Cloud quotas. Check Google Cloud Console for details.",
-      };
-    }
-
-    return { message: "Gemini CLI connected. Usage tracked via Google Cloud Console." };
-  } catch (error) {
-    return { message: "Unable to fetch Gemini usage. Check Google Cloud Console." };
-  }
 }
 
 /**
@@ -348,9 +316,13 @@ async function getAntigravityUsage(
       if (info.isInternal) continue;
       const quotaInfo = (info.quotaInfo as Record<string, unknown>) ?? {};
 
-      if ("remainingFraction" in quotaInfo) {
+      // Process models with any quota metadata (exhausted models may have only resetTime, active models have remainingFraction, credit-based models have empty quotaInfo)
+      if (Object.keys(quotaInfo).length > 0) {
+        // Default to 0 when remainingFraction is undefined/null/invalid, clamp to valid range [0, 1]
         const fraction =
-          typeof quotaInfo.remainingFraction === "number" ? quotaInfo.remainingFraction : 1;
+          typeof quotaInfo.remainingFraction === "number"
+            ? Math.max(0, Math.min(1, quotaInfo.remainingFraction))
+            : 0;
         const resetTime = typeof quotaInfo.resetTime === "string" ? quotaInfo.resetTime : null;
         modelQuotas[modelId] = {
           remaining: Math.round(fraction * 100),
@@ -360,7 +332,7 @@ async function getAntigravityUsage(
         quotaModelsTotal++;
         if (fraction > 0) quotaModelsAvailable++;
       }
-      // Credit-based models have no remainingFraction — their availability is
+      // Credit-based models have empty quotaInfo — their availability is
       // tracked via the GOOGLE_ONE_AI credit balance cached from SSE responses.
     }
 

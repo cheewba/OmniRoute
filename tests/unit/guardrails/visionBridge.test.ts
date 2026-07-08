@@ -38,6 +38,7 @@ function createGuardrail(options?: Parameters<typeof VisionBridgeGuardrail>[0]) 
         }
         return mockVisionResponse;
       },
+      ...(options?.deps ?? {}),
     },
   });
 }
@@ -328,7 +329,7 @@ test("VB-S04: processes multiple images and concatenates descriptions", async ()
 
 // ── VB-S03: Fail-open on vision error ──────────────────────────────────────
 
-test("VB-S03: returns modified payload with unavailable text when vision API fails", async () => {
+test("VB-S03: preserves the original image when the vision API fails (#4012)", async () => {
   shouldVisionFail = true;
   const guardrail = createGuardrail();
 
@@ -351,9 +352,8 @@ test("VB-S03: returns modified payload with unavailable text when vision API fai
   const result = await guardrail.preCall(payload, createContext({ model: "minimax/minimax-01" }));
 
   assert.strictEqual(result.block, false);
-  assert.ok(result.modifiedPayload);
 
-  const modified = result.modifiedPayload as {
+  const modified = (result.modifiedPayload ?? payload) as {
     messages: Array<{ content: unknown[] }>;
   };
   const content = modified.messages[0].content as Array<{
@@ -361,9 +361,12 @@ test("VB-S03: returns modified payload with unavailable text when vision API fai
     text?: string;
   }>;
 
-  // Should have "unavailable" text instead of image
+  // #4012: a failed describe must NOT replace the image with an "(unavailable)"
+  // stub — the original image is preserved so a vision-capable upstream can see it.
+  const imagePart = content.find((p) => p.type === "image_url");
+  assert.ok(imagePart, "original image_url part must be preserved on describe failure");
   const unavailPart = content.find((p) => p.type === "text" && p.text?.includes("unavailable"));
-  assert.ok(unavailPart);
+  assert.strictEqual(unavailPart, undefined);
 });
 
 test("VB-S03: logs warning when vision API fails", async () => {
@@ -500,4 +503,73 @@ test("VB-S10: returns meta with imagesProcessed count", async () => {
   assert.strictEqual((meta.descriptions as string[]).length, 2);
   assert.strictEqual(typeof meta.processingTimeMs, "number");
   assert.strictEqual(meta.visionModel, "openai/gpt-4o-mini");
+});
+
+// ── VB-S11: Combo mapping forces vision processing despite vision-capable model ──
+
+test("VB-S11: processes images when vision-capable model has combo mapping", async () => {
+  mockVisionResponse = "A description from combo-mapped vision bridge";
+  const guardrail = createGuardrail({
+    deps: {
+      checkModelHasComboMapping: async (_model: string) => true,
+    },
+  });
+
+  const payload = createPayload({
+    model: "openai/gpt-4o",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "What is this?" },
+          {
+            type: "image_url",
+            image_url: { url: "https://example.com/image.png" },
+          },
+        ],
+      },
+    ],
+  });
+
+  const startCallCount = visionCallCount;
+  const result = await guardrail.preCall(payload, createContext({ model: "openai/gpt-4o" }));
+
+  // Vision bridge should have processed the image
+  assert.strictEqual(result.block, false);
+  assert.ok(visionCallCount > startCallCount, "Expected vision model to be called");
+  assert.ok(
+    result.modifiedPayload !== undefined,
+    "Expected modifiedPayload when combo mapping forces vision bridge"
+  );
+});
+
+test("VB-S11b: passthroughs when vision-capable model has NO combo mapping", async () => {
+  const guardrail = createGuardrail({
+    deps: {
+      checkModelHasComboMapping: async (_model: string) => false,
+    },
+  });
+
+  const payload = createPayload({
+    model: "openai/gpt-4o",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "What is this?" },
+          {
+            type: "image_url",
+            image_url: { url: "https://example.com/image.png" },
+          },
+        ],
+      },
+    ],
+  });
+
+  const result = await guardrail.preCall(payload, createContext({ model: "openai/gpt-4o" }));
+
+  // Vision bridge should skip (passthrough) since model supports vision and no combo mapping
+  assert.strictEqual(result.block, false);
+  assert.strictEqual(result.modifiedPayload, undefined);
+  assert.strictEqual(visionCallCount, 0);
 });

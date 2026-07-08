@@ -294,7 +294,12 @@ test("refreshKimiCodingToken adds provider-specific headers and fields", async (
       });
     },
     async () => {
-      const result = await refreshKimiCodingToken("kimi-refresh", log);
+      // Pass providerSpecificData with a stable deviceId (second positional arg after signature change)
+      const result = await refreshKimiCodingToken(
+        "kimi-refresh",
+        { deviceId: "test-stable-device" },
+        log
+      );
       assert.deepEqual(result, {
         accessToken: "kimi-access",
         refreshToken: "kimi-refresh-next",
@@ -306,9 +311,18 @@ test("refreshKimiCodingToken adds provider-specific headers and fields", async (
   );
 
   assert.equal(calls[0].url, PROVIDERS["kimi-coding"].refreshUrl);
-  assert.equal(calls[0].options.headers["X-Msh-Platform"], "omniroute");
-  assert.equal(calls[0].options.headers["X-Msh-Version"], "2.1.2");
-  assert.match(calls[0].options.headers["X-Msh-Device-Id"], /^kimi-refresh-/);
+  // Platform is now "kimi_cli" (matching the real Kimi CLI fingerprint)
+  assert.equal(calls[0].options.headers["X-Msh-Platform"], "kimi_cli");
+  // Version comes from KIMI_CLI_VERSION env or default "1.36.0"
+  assert.ok(calls[0].options.headers["X-Msh-Version"], "X-Msh-Version must be set");
+  // Device-Id must NOT be an ephemeral "kimi-refresh-<timestamp>" value
+  assert.ok(
+    calls[0].options.headers["X-Msh-Device-Id"] &&
+      !calls[0].options.headers["X-Msh-Device-Id"].startsWith("kimi-refresh-"),
+    "X-Msh-Device-Id must be stable (not ephemeral kimi-refresh-<timestamp>)"
+  );
+  // When providerSpecificData.deviceId is provided, it should be used directly
+  assert.equal(calls[0].options.headers["X-Msh-Device-Id"], "test-stable-device");
   assert.match(bodyToString(calls[0].options.body), /grant_type=refresh_token/);
 });
 
@@ -403,7 +417,8 @@ test("refreshQwenToken surfaces invalid_request as unrecoverable", async () => {
     async () => textResponse(JSON.stringify({ error: "invalid_request" }), 400),
     async () => {
       const result = await refreshQwenToken("qwen-refresh", log);
-      assert.deepEqual(result, { error: "invalid_request" });
+      // Normalized to unrecoverable_refresh_error sentinel (Fix 4)
+      assert.deepEqual(result, { error: "unrecoverable_refresh_error", code: "invalid_request" });
     }
   );
 });
@@ -419,6 +434,37 @@ test("refreshCodexToken recognizes refresh_token_reused responses", async () => 
         error: "unrecoverable_refresh_error",
         code: "refresh_token_reused",
       });
+    }
+  );
+});
+
+// Port from decolua/9router#1821 (sacwooky): a 401 from OpenAI's OAuth token
+// endpoint means the refresh credential itself was rejected (e.g. rotated away
+// or a payload whose error code we do not yet recognize). Retrying with the
+// same refresh token will never succeed — surface re-auth, do not loop.
+test("refreshCodexToken treats any 401 from the token endpoint as unrecoverable", async () => {
+  const log = createLog();
+
+  await withMockedFetch(
+    async () =>
+      textResponse(
+        JSON.stringify({
+          error: {
+            // A payload variant whose code/type are NOT in the existing
+            // unrecoverable set — only the 401 status proves the token is dead.
+            message: "Could not validate your token. Please try signing in again.",
+            type: "invalid_request_error",
+          },
+        }),
+        401
+      ),
+    async () => {
+      const result = await refreshCodexToken("codex-refresh", log);
+      assert.equal(
+        result?.error,
+        "unrecoverable_refresh_error",
+        "401 from OpenAI token endpoint must surface re-auth instead of returning null (which triggers retry)"
+      );
     }
   );
 });
@@ -674,40 +720,43 @@ test("refreshQoderToken uses basic auth once qoder oauth settings are configured
   assert.match(calls[0].options.headers.Authorization, /^Basic /);
 });
 
-test("refreshGitHubToken exchanges the refresh token with github oauth", async () => {
+test("refreshGitHubToken sends the real public github client_id and no client_secret (port from 9router#442)", async () => {
+  // GitHub Copilot's OAuth app is a public device-flow client: it has a client_id but
+  // NO client_secret. PROVIDERS.github.clientId must be populated from the embedded public
+  // cred so the refresh request actually carries a client_id — a missing one makes GitHub
+  // reject the refresh. The previous test patched a fake clientId/clientSecret onto
+  // PROVIDERS.github, masking the fact that the real config had neither. This uses the real
+  // config and asserts the real client_id is sent and no client_secret leaks out.
   const log = createLog();
   const calls: any[] = [];
 
-  await withPatchedProperties(
-    PROVIDERS.github,
-    {
-      clientId: "github-client",
-      clientSecret: "github-secret",
+  await withMockedFetch(
+    async (url, options = {}) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        access_token: "github-access",
+        refresh_token: "github-refresh-next",
+        expires_in: 3600,
+      });
     },
     async () => {
-      await withMockedFetch(
-        async (url, options = {}) => {
-          calls.push({ url, options });
-          return jsonResponse({
-            access_token: "github-access",
-            refresh_token: "github-refresh-next",
-            expires_in: 3600,
-          });
-        },
-        async () => {
-          const result = await refreshGitHubToken("github-refresh", log);
-          assert.deepEqual(result, {
-            accessToken: "github-access",
-            refreshToken: "github-refresh-next",
-            expiresIn: 3600,
-          });
-        }
-      );
+      const result = await refreshGitHubToken("github-refresh", log);
+      assert.deepEqual(result, {
+        accessToken: "github-access",
+        refreshToken: "github-refresh-next",
+        expiresIn: 3600,
+      });
     }
   );
 
+  const body = bodyToString(calls[0].options.body);
   assert.equal(calls[0].url, OAUTH_ENDPOINTS.github.token);
-  assert.match(bodyToString(calls[0].options.body), /client_id=github-client/);
+  assert.ok(
+    PROVIDERS.github.clientId,
+    "PROVIDERS.github.clientId must be populated from the public cred"
+  );
+  assert.match(body, /client_id=Iv1\./, "the real public github client_id must be sent on refresh");
+  assert.ok(!body.includes("client_secret="), "no client_secret for the public github client");
 });
 
 test("refreshCopilotToken returns the short-lived copilot token", async () => {
@@ -1189,6 +1238,12 @@ test("getAccessToken per-connection mutex: mutex cleared after success, next cal
   const log = createLog();
   let upstreamCallCount = 0;
 
+  // The rotation map (added for the codex-multi-auth pattern) is process-wide
+  // and intentionally redirects a stale-token caller to the cached rotated
+  // tokens. Clear it BEFORE and BETWEEN calls so this test exercises the
+  // lower-level mutex semantics it was designed for.
+  tokenRefresh._clearTokenRotationMap();
+
   await withPatchedProperties(
     PROVIDERS,
     { "custom-oauth-conn-mutex": { tokenUrl: "https://auth.example.com/token" } },
@@ -1206,6 +1261,7 @@ test("getAccessToken per-connection mutex: mutex cleared after success, next cal
           const credentials = { connectionId: "conn-refire", refreshToken: "rt" };
 
           const first = await getAccessToken("custom-oauth-conn-mutex", { ...credentials }, log);
+          tokenRefresh._clearTokenRotationMap();
           const second = await getAccessToken("custom-oauth-conn-mutex", { ...credentials }, log);
 
           assert.equal(upstreamCallCount, 2, "each sequential call fires upstream once");
@@ -1274,7 +1330,9 @@ test("refreshClaudeOAuthToken returns error object for invalid_grant (expired re
     async () => {
       const result = await refreshClaudeOAuthToken("expired-token", log);
       assert.ok(result && typeof result === "object", "should return error object, not null");
-      assert.equal((result as any).error, "invalid_grant");
+      // Normalized to unrecoverable_refresh_error sentinel (Fix 6)
+      assert.equal((result as any).error, "unrecoverable_refresh_error");
+      assert.equal((result as any).code, "invalid_grant");
       assert.ok(isUnrecoverableRefreshError(result), "should be detected as unrecoverable");
     }
   );

@@ -68,9 +68,10 @@ test("canonical model capability resolver lets exact synced metadata override gl
       }),
     },
     antigravity: {
-      // The resolver returns "gemini-3.1-pro-high" unchanged (ANTIGRAVITY_MODEL_ALIASES only maps
-      // the public-facing alias → internal, not the reverse). Save under the canonical resolved key.
-      "gemini-3.1-pro-high": buildCapability({
+      // Since #3229, ANTIGRAVITY_MODEL_ALIASES maps both "gemini-3.1-pro-high" and
+      // "gemini-3.1-pro-low" → "gemini-3.1-pro", so the capability resolver looks
+      // synced metadata up under the canonical "gemini-3.1-pro" key. Save it there.
+      "gemini-3.1-pro": buildCapability({
         tool_call: false,
         reasoning: false,
         modalities_input: JSON.stringify(["text"]),
@@ -107,13 +108,55 @@ test("canonical model capability resolver lets exact synced metadata override gl
 
   const codexGpt55 = modelCapabilities.getResolvedModelCapabilities("codex/gpt-5.5");
   assert.equal(codexGpt55.contextWindow, 400000);
-  assert.equal(codexGpt55.maxInputTokens, 400000);
+  // #6191: max_input_tokens is a distinct, smaller cap than the context window.
+  assert.equal(codexGpt55.maxInputTokens, 272000);
   assert.equal(codexGpt55.maxOutputTokens, 128000);
   assert.equal(codexGpt55.supportsThinking, true);
   assert.equal(codexGpt55.supportsVision, true);
 
+  const bedrockSonnet46 = modelCapabilities.getResolvedModelCapabilities(
+    "bedrock/eu.anthropic.claude-sonnet-4-6"
+  );
+  assert.equal(bedrockSonnet46.contextWindow, 1000000);
+  assert.equal(bedrockSonnet46.maxInputTokens, 1000000);
+  assert.equal(bedrockSonnet46.maxOutputTokens, 64000);
+  assert.equal(bedrockSonnet46.supportsVision, true);
+
+  const bedrockSonnet45 = modelCapabilities.getResolvedModelCapabilities(
+    "bedrock/anthropic.claude-sonnet-4-5"
+  );
+  assert.equal(bedrockSonnet45.contextWindow, 200000);
+  assert.equal(bedrockSonnet45.maxOutputTokens, 64000);
+
+  const bedrockOpus46 = modelCapabilities.getResolvedModelCapabilities(
+    "bedrock/anthropic.claude-opus-4-6"
+  );
+  assert.equal(bedrockOpus46.contextWindow, 1000000);
+  assert.equal(bedrockOpus46.maxOutputTokens, 128000);
+
   const bareGpt55 = modelCapabilities.getResolvedModelCapabilities("gpt-5.5");
   assert.equal(bareGpt55.contextWindow, 1050000);
+});
+
+test("unknown models keep maxOutputTokens null instead of using a generic default", () => {
+  const unknown = modelCapabilities.getResolvedModelCapabilities(
+    "openai-compatible-local/custom-large-output-model"
+  );
+
+  assert.equal(unknown.contextWindow, null);
+  assert.equal(unknown.maxInputTokens, null);
+  assert.equal(unknown.maxOutputTokens, null);
+  assert.equal(
+    modelCapabilities.capMaxOutputTokens(
+      "openai-compatible-local/custom-large-output-model",
+      32000
+    ),
+    32000
+  );
+  assert.equal(
+    modelCapabilities.capMaxOutputTokens("openai-compatible-local/custom-large-output-model"),
+    null
+  );
 });
 
 test("GPT OSS and DeepSeek Reasoner models support tool calling", () => {
@@ -144,4 +187,74 @@ test("Kimi K2.6 supports vision capability", () => {
   // Also test via alias
   const kimiThinking = modelCapabilities.getResolvedModelCapabilities("kimi-k2.6-thinking");
   assert.equal(kimiThinking.supportsVision, true);
+});
+
+test("Kimi K2.7 Code resolves full capabilities instead of the degraded import defaults (#3761)", () => {
+  // Spec-driven, so it works for any provider serving the model.
+  const kimi = modelCapabilities.getResolvedModelCapabilities("kimi-k2.7-code");
+  assert.equal(kimi.contextWindow, 262144);
+  assert.equal(kimi.maxOutputTokens, 262144);
+  assert.equal(kimi.supportsVision, true);
+  assert.equal(kimi.supportsThinking, true);
+  assert.equal(kimi.supportsTools, true);
+
+  // The reported case: imported via Ollama Cloud's "import from /models". Before the
+  // fix this had no spec/registry entry, so context fell back to the 128000 default
+  // and max output to 8192, with vision dropped.
+  const ollama = modelCapabilities.getResolvedModelCapabilities("ollama-cloud/kimi-k2.7-code");
+  assert.equal(ollama.contextWindow, 262144);
+  assert.equal(ollama.maxOutputTokens, 262144);
+  assert.equal(ollama.supportsVision, true);
+  assert.notEqual(ollama.contextWindow, 128000);
+  assert.notEqual(ollama.maxOutputTokens, 8192);
+});
+
+test("GLM-5.2 context limits respect provider-hosted caps", () => {
+  modelsDevSync.saveModelsDevCapabilities({
+    huggingface: {
+      "zai-org/GLM-5.2": buildCapability({
+        limit_context: 128000,
+        limit_input: 128000,
+        limit_output: 128000,
+      }),
+    },
+    "cloudflare-ai": {
+      "@cf/zai-org/glm-5.2": buildCapability({
+        limit_context: 128000,
+        limit_input: 128000,
+        limit_output: 128000,
+      }),
+    },
+    zenmux: {
+      "z-ai/glm-5.2": buildCapability({
+        limit_context: 128000,
+        limit_input: 128000,
+        limit_output: 128000,
+      }),
+    },
+  });
+
+  for (const modelId of ["glm-5.2", "opencode-go/glm-5.2", "opencode/glm-5.2", "oc/glm-5.2"]) {
+    const capabilities = modelCapabilities.getResolvedModelCapabilities(modelId);
+    assert.equal(capabilities.contextWindow, 1000000, modelId);
+    assert.equal(capabilities.maxInputTokens, 1000000, modelId);
+  }
+
+  for (const modelId of ["zenmux/z-ai/glm-5.2", "zenmux/z-ai/glm-5.2-free"]) {
+    const capabilities = modelCapabilities.getResolvedModelCapabilities(modelId);
+    assert.equal(capabilities.contextWindow, 1000000, modelId);
+    assert.equal(capabilities.maxInputTokens, 1000000, modelId);
+  }
+
+  for (const modelId of ["cloudflare-ai/@cf/zai-org/glm-5.2", "cf/@cf/zai-org/glm-5.2"]) {
+    const capabilities = modelCapabilities.getResolvedModelCapabilities(modelId);
+    assert.equal(capabilities.contextWindow, 262144, modelId);
+    assert.equal(capabilities.maxInputTokens, 262144, modelId);
+  }
+
+  for (const modelId of ["huggingface/zai-org/GLM-5.2", "hf/zai-org/GLM-5.2"]) {
+    const capabilities = modelCapabilities.getResolvedModelCapabilities(modelId);
+    assert.equal(capabilities.contextWindow, 262144, modelId);
+    assert.equal(capabilities.maxInputTokens, 262144, modelId);
+  }
 });

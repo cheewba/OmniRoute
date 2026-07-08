@@ -2,7 +2,7 @@
  * POST /v1/web/fetch
  *
  * Extract content from a URL using a configured web-fetch provider.
- * Supports Firecrawl, Jina Reader, and Tavily Extract.
+ * Supports Firecrawl, Jina Reader, Tavily Extract, and TinyFish Fetch.
  *
  * Request: { url, provider?, format?, depth?, wait_for_selector?, include_metadata? }
  * Response: { provider, url, content, links, metadata, screenshot_url }
@@ -14,6 +14,7 @@ import { handleWebFetch } from "@omniroute/open-sse/handlers/webFetch.ts";
 import * as log from "@/sse/utils/logger";
 import { extractApiKey, isValidApiKey, getProviderCredentials } from "@/sse/services/auth";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import { isRequireApiKeyEnabled } from "@/shared/utils/featureFlags";
 import { v1WebFetchSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -22,7 +23,7 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "*",
 };
 
-const WEB_FETCH_PROVIDERS = ["firecrawl", "jina-reader", "tavily-search"] as const;
+const WEB_FETCH_PROVIDERS = ["firecrawl", "jina-reader", "tavily-search", "tinyfish"] as const;
 type WebFetchProviderId = (typeof WEB_FETCH_PROVIDERS)[number];
 
 export async function OPTIONS() {
@@ -61,7 +62,7 @@ export async function POST(request: Request) {
 
   // Optional auth check
   const apiKeyRaw = extractApiKey(request);
-  if (process.env.REQUIRE_API_KEY === "true" && !apiKeyRaw) {
+  if (isRequireApiKeyEnabled() && !apiKeyRaw) {
     return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Authentication required");
   }
   if (apiKeyRaw && !(await isValidApiKey(apiKeyRaw))) {

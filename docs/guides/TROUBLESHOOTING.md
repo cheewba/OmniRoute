@@ -1,14 +1,40 @@
 ---
 title: "Troubleshooting"
-version: 3.8.2
-lastUpdated: 2026-05-13
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # Troubleshooting
 
+> **For Users**: Looking for quick fixes? See the [Quick Reference](#quick-reference) below.
+
 🌐 **Languages:** 🇺🇸 [English](./TROUBLESHOOTING.md) | 🇧🇷 [Português (Brasil)](../i18n/pt-BR/docs/guides/TROUBLESHOOTING.md) | 🇪🇸 [Español](../i18n/es/docs/guides/TROUBLESHOOTING.md) | 🇫🇷 [Français](../i18n/fr/docs/guides/TROUBLESHOOTING.md) | 🇮🇹 [Italiano](../i18n/it/docs/guides/TROUBLESHOOTING.md) | 🇷🇺 [Русский](../i18n/ru/docs/guides/TROUBLESHOOTING.md) | 🇨🇳 [中文 (简体)](../i18n/zh-CN/docs/guides/TROUBLESHOOTING.md) | 🇩🇪 [Deutsch](../i18n/de/docs/guides/TROUBLESHOOTING.md) | 🇮🇳 [हिन्दी](../i18n/in/docs/guides/TROUBLESHOOTING.md) | 🇹🇭 [ไทย](../i18n/th/docs/guides/TROUBLESHOOTING.md) | 🇺🇦 [Українська](../i18n/uk-UA/docs/guides/TROUBLESHOOTING.md) | 🇸🇦 [العربية](../i18n/ar/docs/guides/TROUBLESHOOTING.md) | 🇯🇵 [日本語](../i18n/ja/docs/guides/TROUBLESHOOTING.md) | 🇻🇳 [Tiếng Việt](../i18n/vi/docs/guides/TROUBLESHOOTING.md) | 🇧🇬 [Български](../i18n/bg/docs/guides/TROUBLESHOOTING.md) | 🇩🇰 [Dansk](../i18n/da/docs/guides/TROUBLESHOOTING.md) | 🇫🇮 [Suomi](../i18n/fi/docs/guides/TROUBLESHOOTING.md) | 🇮🇱 [עברית](../i18n/he/docs/guides/TROUBLESHOOTING.md) | 🇭🇺 [Magyar](../i18n/hu/docs/guides/TROUBLESHOOTING.md) | 🇮🇩 [Bahasa Indonesia](../i18n/id/docs/guides/TROUBLESHOOTING.md) | 🇰🇷 [한국어](../i18n/ko/docs/guides/TROUBLESHOOTING.md) | 🇲🇾 [Bahasa Melayu](../i18n/ms/docs/guides/TROUBLESHOOTING.md) | 🇳🇱 [Nederlands](../i18n/nl/docs/guides/TROUBLESHOOTING.md) | 🇳🇴 [Norsk](../i18n/no/docs/guides/TROUBLESHOOTING.md) | 🇵🇹 [Português (Portugal)](../i18n/pt/docs/guides/TROUBLESHOOTING.md) | 🇷🇴 [Română](../i18n/ro/docs/guides/TROUBLESHOOTING.md) | 🇵🇱 [Polski](../i18n/pl/docs/guides/TROUBLESHOOTING.md) | 🇸🇰 [Slovenčina](../i18n/sk/docs/guides/TROUBLESHOOTING.md) | 🇸🇪 [Svenska](../i18n/sv/docs/guides/TROUBLESHOOTING.md) | 🇵🇭 [Filipino](../i18n/phi/docs/guides/TROUBLESHOOTING.md) | 🇨🇿 [Čeština](../i18n/cs/docs/guides/TROUBLESHOOTING.md)
 
 Common problems and solutions for OmniRoute.
+
+---
+
+## Quick Reference
+
+**New to OmniRoute?** Start here — these solve 90% of problems:
+
+| I see this              | What it means                       | What to do                                                                                        |
+| ----------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------- |
+| "Can't connect"         | OmniRoute isn't running             | Run `omniroute` or `docker restart omniroute`                                                     |
+| "Invalid API key"       | Your key is wrong or expired        | Re-copy the key from the provider's website                                                       |
+| "Rate limit exceeded"   | You're sending too many requests    | Wait 1 minute, or use `model: "auto"` for automatic fallback                                      |
+| "Quota exceeded"        | You've used up your free/paid quota | Connect more providers, or use free providers (Kiro, Pollinations)                                |
+| "Slow responses"        | Provider is busy or far away        | Use `model: "auto/fast"` or connect a faster provider (Groq, Cerebras)                            |
+| "Wrong provider used"   | `auto` picked a different provider  | That's normal! `auto` picks the best one. Force a specific provider with `model: "openai/gpt-4o"` |
+| "502 Bad Gateway"       | Provider is down                    | Wait and retry, or use `model: "auto"` to switch providers                                        |
+| "401 Unauthorized"      | Your credentials are wrong          | Check your API key or re-authenticate with OAuth                                                  |
+| "429 Too Many Requests" | Rate limited                        | Wait 1 minute, or connect more providers                                                          |
+
+**Still stuck?** See the [detailed troubleshooting](#detailed-troubleshooting) below, or ask on [Discord](https://discord.gg/EkzRkpzKYt).
+
+---
+
+## Detailed Troubleshooting
 
 ---
 
@@ -33,7 +59,7 @@ Common problems and solutions for OmniRoute.
 
 ### Login page crashes or shows "Module self-registration" error
 
-**Cause:** You are running a Node.js version outside OmniRoute's approved secure runtime floor. The most common case is running an older Node 20, 22, or 24 patch level that falls below the patched security floor OmniRoute requires.
+**Cause:** You are running a Node.js version outside OmniRoute's approved secure runtime floor. The most common case is running an older Node 22 or 24 patch level that falls below the patched security floor OmniRoute requires.
 
 **Symptoms:**
 
@@ -52,7 +78,7 @@ Common problems and solutions for OmniRoute.
 3. Reinstall OmniRoute: `npm install -g omniroute`
 4. Restart: `omniroute`
 
-> **Supported secure versions:** `>=20.20.2 <21`, `>=22.22.2 <23`, or `>=24.0.0 <27`. Node.js 24.x LTS (Krypton) and Node.js 26 are fully supported.
+> **Supported secure versions:** `>=22.22.2 <23` or `>=24.0.0 <27`. Node.js 24.x LTS (Krypton) and Node.js 26 are fully supported.
 
 ### macOS: `dlopen` / "slice is not valid mach-o file"
 
@@ -78,7 +104,7 @@ npm rebuild better-sqlite3
 omniroute
 ```
 
-> **Note:** This recompiles the native binding against your local Node.js version and CPU architecture, resolving the binary mismatch. The officially supported range is **`>=20.20.2 <21`, `>=22.22.2 <23`, or `>=24.0.0 <27`** (`engines` field in `package.json`). Node.js 24.x LTS (Krypton) and Node.js 26 are fully supported with `better-sqlite3` v12.x.
+> **Note:** This recompiles the native binding against your local Node.js version and CPU architecture, resolving the binary mismatch. The officially supported runtime range is **`>=22.22.2 <23` or `>=24.0.0 <27`** (`SUPPORTED_NODE_RANGE` in `src/shared/utils/nodeRuntimeSupport.ts`, aligned with the `package.json` `engines` field). Node.js 24.x LTS (Krypton) and Node.js 26 are fully supported with `better-sqlite3` v12.x.
 
 ---
 
@@ -103,6 +129,12 @@ omniroute
 **Cause:** On Node.js 22, the undici@8 dispatcher is incompatible with Node's built-in `fetch()` implementation.
 
 **Fix (v3.5.5+):** OmniRoute now uses undici's own `fetch()` function when a proxy dispatcher is active, ensuring consistent behavior. Update to v3.5.5+.
+
+### MITM proxy under WSL: desktop apps on the Windows host are not intercepted
+
+**Cause:** The MITM proxy and its CA certificate install into the environment where OmniRoute runs. Under WSL that environment is the Linux guest, while the AI desktop apps (Kiro, Trae, Copilot, Zed, …) run on the Windows host. The host apps do not trust the guest's certificate store and do not route through the guest's system proxy, so desktop interception does not engage there.
+
+**Recommendation:** Run OmniRoute natively on the same OS as the desktop apps you want to intercept (Windows for Windows apps; macOS/Linux likewise). Keeping OmniRoute inside WSL while targeting host apps requires manually trusting the generated CA certificate on the Windows host and pointing each host app's network/proxy settings at the WSL proxy endpoint — an unsupported, fragile setup.
 
 ---
 
@@ -205,7 +237,7 @@ curl -s http://localhost:20128/api/cli-tools/openclaw-settings | jq '{installed,
 
 1. Check usage stats in Dashboard → Usage
 2. Switch primary model to GLM/MiniMax
-3. Use free tier (Gemini CLI, Qoder) for non-critical tasks
+3. Use free tier (Qoder, Kiro) for non-critical tasks
 4. Set cost budgets per API key: Dashboard → API Keys → Budget
 
 ---
@@ -236,6 +268,9 @@ curl http://localhost:20128/api/monitoring/health
 - Usage: SQLite tables in `storage.sqlite` (`usage_history`, `call_logs`, `proxy_logs`) + optional `${DATA_DIR}/call_logs/`
 - Application logs: `<repo>/logs/...` (when `APP_LOG_TO_FILE=true`)
 - Call log artifacts: `${DATA_DIR}/call_logs/YYYY-MM-DD/...` when the call log pipeline is enabled
+
+The Request Logs page's **Clean history** action clears `call_logs`, legacy
+`request_detail_logs`, and the local `${DATA_DIR}/call_logs/` artifact directory.
 
 ---
 

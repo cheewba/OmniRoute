@@ -19,8 +19,21 @@ import { sanitizeErrorMessage } from "../utils/error.ts";
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const GEMINI_URL = "https://gemini.google.com/app";
+
+/**
+ * Whether an error came from Playwright failing to launch because the browser binary is not
+ * installed (`chromium.launch: Executable doesn't exist at ...`). This is a host/config
+ * problem, not a transient upstream fault, so the executor must NOT surface it as a retryable
+ * 500 (which marks the account unavailable and loops / trips the provider breaker). See #3516.
+ */
+export function isMissingBrowserExecutable(message: string): boolean {
+  if (!message) return false;
+  return /executable doesn't exist|executablenotfound|playwright install|chromium.*download/i.test(
+    message
+  );
+}
 const GEMINI_USER_AGENT =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -98,16 +111,21 @@ function parseCookies(raw: string): Array<{ name: string; value: string }> {
  *   <length>
  *   [["wrb.fr", null, "<JSON string>"]]
  *
- * The JSON string contains nested array: inner[4][0][1] = ["text chunks"]
- * We return text from the first wrb.fr line that contains content.
+ * The JSON string contains nested array: inner[4][0][1] = ["text chunks"].
+ * We concatenate text from every wrb.fr line because Gemini can split one
+ * assistant answer across multiple StreamGenerate chunks.
  */
-function parseStreamResponse(raw: string): string {
+export function parseStreamResponse(raw: string): string {
   const lines = raw.split("\n");
-  for (const line of lines) {
-    if (!line.trim() || line.trim() === ")]}'" || /^\d+$/.test(line.trim())) continue;
+  const textChunks: string[] = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line === ")]}'" || /^\d+$/.test(line)) continue;
+    if (!line.includes("wrb.fr")) continue;
     try {
       const arr = JSON.parse(line);
-      if (!Array.isArray(arr) || !arr[0] || arr[0][0] !== "wrb.fr") continue;
+      if (!Array.isArray(arr) || !Array.isArray(arr[0]) || arr[0][0] !== "wrb.fr") continue;
       const payload = arr[0]?.[2];
       if (typeof payload !== "string") continue;
       const inner = JSON.parse(payload);
@@ -115,12 +133,63 @@ function parseStreamResponse(raw: string): string {
       const responseArray = inner?.[4]?.[0]?.[1];
       if (!Array.isArray(responseArray)) continue;
       const text = responseArray.filter((c: unknown) => typeof c === "string").join("");
-      if (text) return text;
+      if (text) textChunks.push(text);
     } catch {
       // Skip unparseable lines
     }
   }
+  return textChunks.join("");
+}
+
+function readCredentialString(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : "";
+}
+
+function readProviderSpecificString(
+  providerSpecificData: unknown,
+  keys: readonly string[]
+): string {
+  if (
+    !providerSpecificData ||
+    typeof providerSpecificData !== "object" ||
+    Array.isArray(providerSpecificData)
+  ) {
+    return "";
+  }
+  const data = providerSpecificData as Record<string, unknown>;
+  for (const key of keys) {
+    const value = readCredentialString(data[key]);
+    if (value) return value;
+  }
   return "";
+}
+
+function normalizeGeminiCookieInput(raw: string, cookieName = "__Secure-1PSID"): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  return trimmed.includes("=") ? trimmed : `${cookieName}=${trimmed}`;
+}
+
+function resolveGeminiWebCookie(credentials: ExecuteInput["credentials"]): string {
+  const directCookie =
+    readCredentialString(credentials?.apiKey) ||
+    readCredentialString((credentials as Record<string, unknown> | undefined)?.cookie);
+  if (directCookie) return normalizeGeminiCookieInput(directCookie);
+
+  const providerSpecificData = credentials?.providerSpecificData;
+  const cookie = readProviderSpecificString(providerSpecificData, ["cookie"]);
+  if (cookie) return normalizeGeminiCookieInput(cookie);
+
+  const psid = readProviderSpecificString(providerSpecificData, ["__Secure-1PSID"]);
+  const psidts = readProviderSpecificString(providerSpecificData, ["__Secure-1PSIDTS"]);
+  return [
+    psid ? normalizeGeminiCookieInput(psid, "__Secure-1PSID") : "",
+    psidts ? normalizeGeminiCookieInput(psidts, "__Secure-1PSIDTS") : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
 }
 
 // ─── Executor ───────────────────────────────────────────────────────────────
@@ -131,10 +200,10 @@ export class GeminiWebExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
-    const { model, body, stream, credentials } = input;
+    const { model, body, stream, credentials, signal } = input;
     const requestBody = body as GeminiRequestBody;
 
-    const cookie = credentials.apiKey || "";
+    const cookie = resolveGeminiWebCookie(credentials);
     if (!cookie) {
       return {
         response: new Response(JSON.stringify({ error: "Missing Gemini cookies" }), {
@@ -164,9 +233,18 @@ export class GeminiWebExecutor extends BaseExecutor {
     }
 
     let browser: any = null;
+    let abortBrowser: (() => void) | null = null;
     try {
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new Error("Request aborted");
+      }
       const { chromium } = await import("playwright");
       browser = await chromium.launch({ headless: true });
+      abortBrowser = () => {
+        void browser?.close().catch(() => {});
+      };
+      signal?.addEventListener("abort", abortBrowser, { once: true });
+
       const context = await browser.newContext({ userAgent: GEMINI_USER_AGENT });
 
       // Parse cookies — strips attributes like Path, Domain, Expires
@@ -201,6 +279,9 @@ export class GeminiWebExecutor extends BaseExecutor {
       });
 
       await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded", timeout: 20000 });
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new Error("Request aborted");
+      }
       await page.waitForTimeout(3000);
 
       // Type and send message
@@ -214,6 +295,9 @@ export class GeminiWebExecutor extends BaseExecutor {
 
       // Wait for response or timeout
       await Promise.race([responsePromise, page.waitForTimeout(30000)]);
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new Error("Request aborted");
+      }
 
       if (!responseText) {
         return {
@@ -233,20 +317,25 @@ export class GeminiWebExecutor extends BaseExecutor {
         // Pseudo-streaming: send complete response as single SSE chunk
         // Gemini's StreamGenerate returns complete responses, not chunked streams
         const encoder = new TextEncoder();
-        const readable = new ReadableStream({
-          start(controller) {
-            controller.enqueue(
-              encoder.encode(
-                `data: ${JSON.stringify(formatStreamChunk(responseText, modelId))}\n\n`
-              )
-            );
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify(formatStreamChunk("", modelId, "stop"))}\n\n`)
-            );
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-            controller.close();
+        const readable = new ReadableStream(
+          {
+            start(controller) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify(formatStreamChunk(responseText, modelId))}\n\n`
+                )
+              );
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify(formatStreamChunk("", modelId, "stop"))}\n\n`
+                )
+              );
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close();
+            },
           },
-        });
+          { highWaterMark: 16384 }
+        );
         return {
           response: new Response(readable, {
             status: 200,
@@ -272,10 +361,36 @@ export class GeminiWebExecutor extends BaseExecutor {
         transformedBody: body,
       };
     } catch (error) {
+      const rawMessage = error instanceof Error ? error.message : "Unknown error";
+      // #3516: a missing Playwright browser is a host/config problem, not a transient upstream
+      // fault. Surface an actionable error and tag it with the connection-cooldown hint so
+      // accountFallback skips the provider circuit breaker and applies a short, non-exponential
+      // cooldown instead of looping on a retryable 500.
+      if (isMissingBrowserExecutable(rawMessage)) {
+        return {
+          response: new Response(
+            JSON.stringify({
+              error:
+                "Gemini Web requires the Playwright Chromium browser, which is not installed. " +
+                "Run `npx playwright install chromium` on the host (or rebuild the Docker image with browsers).",
+            }),
+            {
+              status: 503,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Omni-Fallback-Hint": "connection_cooldown",
+              },
+            }
+          ),
+          url: GEMINI_URL,
+          headers: {},
+          transformedBody: body,
+        };
+      }
       return {
         response: new Response(
           JSON.stringify({
-            error: sanitizeErrorMessage(error instanceof Error ? error.message : "Unknown error"),
+            error: sanitizeErrorMessage(rawMessage),
           }),
           { status: 500, headers: { "Content-Type": "application/json" } }
         ),
@@ -284,6 +399,7 @@ export class GeminiWebExecutor extends BaseExecutor {
         transformedBody: body,
       };
     } finally {
+      if (abortBrowser) signal?.removeEventListener("abort", abortBrowser);
       // Always close browser to prevent resource leaks
       if (browser) {
         try {

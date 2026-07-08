@@ -8,8 +8,10 @@ type ReadTimeoutOptions = {
 
 export const DEFAULT_FETCH_TIMEOUT_MS = 600_000;
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 600_000;
+export const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
 export const DEFAULT_SSE_HEARTBEAT_INTERVAL_MS = 15_000;
 export const DEFAULT_STREAM_READINESS_TIMEOUT_MS = 80_000;
+export const DEFAULT_STREAM_READINESS_MAX_TIMEOUT_MS = 180_000;
 export const DEFAULT_FETCH_CONNECT_TIMEOUT_MS = 30_000;
 export const DEFAULT_FETCH_KEEPALIVE_TIMEOUT_MS = 4_000;
 export const DEFAULT_API_BRIDGE_PROXY_TIMEOUT_MS = 600_000;
@@ -28,6 +30,7 @@ export type UpstreamTimeoutConfig = {
   streamIdleTimeoutMs: number;
   sseHeartbeatIntervalMs: number;
   streamReadinessTimeoutMs: number;
+  streamReadinessMaxTimeoutMs: number;
   fetchHeadersTimeoutMs: number;
   fetchBodyTimeoutMs: number;
   fetchConnectTimeoutMs: number;
@@ -96,7 +99,16 @@ export function getUpstreamTimeoutConfig(
   const streamReadinessTimeoutMs = readTimeoutMs(
     env,
     "STREAM_READINESS_TIMEOUT_MS",
-    DEFAULT_STREAM_READINESS_TIMEOUT_MS,
+    sharedRequestTimeoutMs ?? DEFAULT_STREAM_READINESS_TIMEOUT_MS,
+    {
+      allowZero: true,
+      logger,
+    }
+  );
+  const streamReadinessMaxTimeoutMs = readTimeoutMs(
+    env,
+    "STREAM_READINESS_MAX_TIMEOUT_MS",
+    DEFAULT_STREAM_READINESS_MAX_TIMEOUT_MS,
     {
       allowZero: true,
       logger,
@@ -116,6 +128,7 @@ export function getUpstreamTimeoutConfig(
     fetchTimeoutMs,
     streamIdleTimeoutMs,
     streamReadinessTimeoutMs,
+    streamReadinessMaxTimeoutMs,
     sseHeartbeatIntervalMs,
     fetchHeadersTimeoutMs: readTimeoutMs(env, "FETCH_HEADERS_TIMEOUT_MS", fetchTimeoutMs, {
       allowZero: true,
@@ -190,6 +203,12 @@ export function getApiBridgeTimeoutConfig(
     proxyTimeoutMs > 0
       ? Math.max(proxyTimeoutMs, DEFAULT_API_BRIDGE_SERVER_REQUEST_TIMEOUT_MS)
       : DEFAULT_API_BRIDGE_SERVER_REQUEST_TIMEOUT_MS;
+  const serverRequestDefaultMs =
+    sharedRequestTimeoutMs !== undefined
+      ? sharedRequestTimeoutMs > 0
+        ? Math.max(sharedRequestTimeoutMs, derivedRequestTimeoutMs)
+        : 0
+      : derivedRequestTimeoutMs;
   const serverKeepAliveTimeoutMs = readTimeoutMs(
     env,
     "API_BRIDGE_SERVER_KEEPALIVE_TIMEOUT_MS",
@@ -214,9 +233,7 @@ export function getApiBridgeTimeoutConfig(
     serverRequestTimeoutMs: readTimeoutMs(
       env,
       "API_BRIDGE_SERVER_REQUEST_TIMEOUT_MS",
-      sharedRequestTimeoutMs
-        ? Math.max(sharedRequestTimeoutMs, derivedRequestTimeoutMs)
-        : derivedRequestTimeoutMs,
+      serverRequestDefaultMs,
       {
         allowZero: true,
         logger,
