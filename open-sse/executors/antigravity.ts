@@ -390,6 +390,16 @@ function getRequestTargetModel(body: Record<string, unknown>): string {
  */
 export const MAX_ANTIGRAVITY_OUTPUT_TOKENS = 16384;
 
+function normalizeAntigravitySafetySettings(value: unknown): unknown[] {
+  const settings = Array.isArray(value) ? value : DEFAULT_SAFETY_SETTINGS;
+  // Cloud Code Private API currently rejects CIVIC_INTEGRITY on Antigravity
+  // streamGenerateContent, while the other Gemini safety categories are accepted.
+  return settings.filter((setting) => {
+    if (!setting || typeof setting !== "object") return true;
+    return (setting as Record<string, unknown>).category !== "HARM_CATEGORY_CIVIC_INTEGRITY";
+  });
+}
+
 function applyAntigravityGenerationDefaults(request: Record<string, unknown>): void {
   const generationConfig =
     request.generationConfig && typeof request.generationConfig === "object"
@@ -692,7 +702,7 @@ export class AntigravityExecutor extends BaseExecutor {
       // Previously this was `undefined`, which JSON.stringify drops, so Google Cloud Code
       // applied its server-side defaults that false-flag benign technical prompts as
       // `prohibited_content` (HTTP 200 + blocked body → terminal combo failover).
-      safetySettings: normalizedRequest?.safetySettings ?? DEFAULT_SAFETY_SETTINGS,
+      safetySettings: normalizeAntigravitySafetySettings(normalizedRequest?.safetySettings),
       toolConfig:
         Array.isArray(normalizedRequest?.tools) && normalizedRequest.tools.length > 0
           ? { functionCallingConfig: { mode: "VALIDATED" } }
