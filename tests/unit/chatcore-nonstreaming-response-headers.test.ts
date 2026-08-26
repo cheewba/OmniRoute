@@ -37,6 +37,17 @@ function baseArgs(overrides: Record<string, unknown> = {}) {
   } as Parameters<typeof buildNonStreamingResponseHeaders>[0];
 }
 
+function acceptsAttachMetaInputContract(args: {
+  responseUsage: Record<string, unknown> | null | undefined;
+  requestId: string | null | undefined;
+}) {
+  return args;
+}
+
+test("builder input types match the metadata attachment contract", () => {
+  acceptsAttachMetaInputContract(baseArgs());
+});
+
 test("static headers: Content-Type json + cache MISS", () => {
   const { deps } = makeDeps();
   const h = buildNonStreamingResponseHeaders(baseArgs(), deps);

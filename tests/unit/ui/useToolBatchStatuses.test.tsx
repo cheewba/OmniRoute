@@ -169,6 +169,8 @@ describe("useToolBatchStatuses", () => {
     expect((mockFetch as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(
       callsAfterMount
     );
+    const calls = (mockFetch as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls.at(-1)?.[0]).toBe("/api/cli-tools/all-statuses?refresh=true");
   });
 
   it("registers focus event listener on mount", async () => {

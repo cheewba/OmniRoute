@@ -1,12 +1,7 @@
 import type { RegistryEntry, RegistryModel } from "./providers/shared.ts";
 
 export type ProviderPluginCapability =
-  | "apikey"
-  | "custom-executor"
-  | "oauth"
-  | "passthrough-models"
-  | "responses"
-  | "sidecar-candidate";
+  "apikey" | "custom-executor" | "oauth" | "passthrough-models" | "responses" | "sidecar-candidate";
 
 export interface ProviderPluginModel {
   id: string;
@@ -16,6 +11,7 @@ export interface ProviderPluginModel {
   toolCalling?: boolean;
   supportsReasoning?: boolean;
   supportsVision?: boolean;
+  supportsVideo?: boolean;
   unsupportedParams?: readonly string[];
   targetFormat?: string;
 }
@@ -71,6 +67,7 @@ function mapModel(model: RegistryModel): ProviderPluginModel {
     toolCalling: model.toolCalling,
     supportsReasoning: model.supportsReasoning,
     supportsVision: model.supportsVision,
+    supportsVideo: model.supportsVideo,
     unsupportedParams: model.unsupportedParams,
     targetFormat: model.targetFormat,
   }) as ProviderPluginModel;
@@ -171,6 +168,32 @@ export function generateProviderPluginManifestFromRegistry(
     providers: Object.values(registry)
       .map(createProviderPluginManifestEntry)
       .sort((a, b) => a.id.localeCompare(b.id)),
+  };
+}
+
+/**
+ * Builds a `ProviderPluginManifestEntry` for an embedded-service backend (9router,
+ * cliproxyapi) from its `SERVICE_BACKEND_MANIFEST_TEMPLATE` entry (#7333 Phase 1).
+ *
+ * Additive only — NOT called by `generateProviderPluginManifestFromRegistry()`, so the
+ * static-registry manifest path (260+ providers) is byte-identical before/after this
+ * function's introduction. Not wired into any live request path in this PR; that is
+ * explicitly deferred to the cliproxyapi-migration follow-up.
+ *
+ * Service backends have no static model list of their own — their models come from
+ * `getServiceModels()` at runtime, so `models` is always `[]` here.
+ */
+export function createServiceBackendManifestEntry(
+  pluginId: string,
+  template: Pick<
+    ProviderPluginManifestEntry,
+    "format" | "executor" | "auth" | "endpoints" | "capabilities" | "passthroughModels" | "sidecar"
+  >
+): ProviderPluginManifestEntry {
+  return {
+    id: pluginId,
+    ...template,
+    models: [],
   };
 }
 

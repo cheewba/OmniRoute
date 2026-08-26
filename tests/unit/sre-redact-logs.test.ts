@@ -131,7 +131,7 @@ test("redactString: github_pat_ token is redacted", () => {
 // ─── 7. AWS keys ────────────────────────────────────────────────────────────
 
 test("redactString: AKIA access key is redacted", () => {
-  const key = "AKIAIOSFODNN7EXAMPLE"; // 20 chars
+  const key = "AKIAEXAMPLE123456789"; // 20 chars
   const { output, counts } = redactString(`aws_access_key_id=${key}`);
   assert.match(output, /\[REDACTED_AWS_KEY\]/);
   assert.equal(counts.AWS_KEY, 1);

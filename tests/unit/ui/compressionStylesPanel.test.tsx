@@ -2,10 +2,7 @@
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import {
-  OUTPUT_STYLE_IDS,
-  outputStyleMeta,
-} from "../../../open-sse/services/compression/outputStyles/catalog.ts";
+import { OUTPUT_STYLE_IDS } from "../../../open-sse/services/compression/outputStyles/catalog.ts";
 
 // Locale is mutable per-test so we can exercise the locale gate (terse-cjk → zh only).
 const intl = vi.hoisted(() => ({ locale: "en" }));
@@ -96,7 +93,7 @@ describe("CompressionPanel output styles", () => {
     for (const id of OUTPUT_STYLE_IDS) {
       const row = container.querySelector(`[data-testid="output-style-row-${id}"]`);
       expect(row, `expected a row for style "${id}"`).toBeTruthy();
-      expect(container.textContent).toContain(outputStyleMeta(id).label);
+      expect(row?.textContent).toContain(`compressionOutputStyle.${id}.label`);
     }
   });
 

@@ -77,19 +77,28 @@ test("#5109: transient unreachable results use a short negative cache", async ()
   }
 });
 
-test("T14: runWithProxyContext fast-fails when proxy is unreachable", async () => {
+test("T14: runWithProxyContext fails an in-flight request fast when the proxy is unreachable", async () => {
   const proxyUrl = "http://127.0.0.1:1";
   invalidateProxyHealth(proxyUrl);
 
+  // #9100: the T14 probe is now NON-BLOCKING — dispatch is optimistic and the
+  // probe aborts the request only while it is still in flight. To observe the
+  // fast-fail the callback must stay pending long enough for the probe to
+  // resolve (a callback that resolves instantly would simply win the race).
   let executed = false;
-  await assert.rejects(
-    () =>
-      runWithProxyContext(proxyUrl, async () => {
-        executed = true;
-        return "ok";
-      }),
-    (err) => (err as { code?: string })?.code === "PROXY_UNREACHABLE"
-  );
+  let releaseRequest: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    releaseRequest = resolve;
+  });
 
-  assert.equal(executed, false);
+  const pending = runWithProxyContext(proxyUrl, async () => {
+    executed = true;
+    await gate; // stay in flight until the probe resolves unreachable
+    return "ok";
+  });
+
+  await assert.rejects(pending, (err) => (err as { code?: string })?.code === "PROXY_UNREACHABLE");
+
+  assert.equal(executed, true, "dispatch is optimistic; the request was started before the abort");
+  releaseRequest();
 });

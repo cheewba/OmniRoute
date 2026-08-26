@@ -43,6 +43,34 @@ function baseArgs(overrides: Record<string, unknown> = {}) {
   } as Parameters<typeof storeStreamingSemanticCacheResponse>[0];
 }
 
+function assertNumericSignatureInputs(
+  deps: Parameters<typeof storeStreamingSemanticCacheResponse>[1]
+): void {
+  if (process.env.NODE_ENV === "__semantic_cache_type_contract__") {
+    storeStreamingSemanticCacheResponse(
+      {
+        enabled: true,
+        streamStatus: 200,
+        streamResponseBody: {},
+        body: {
+          messages: [],
+          temperature: 0,
+          // @ts-expect-error top_p is a numeric producer field
+          top_p: "1",
+        },
+        headers: undefined,
+        model: "gpt-x",
+      },
+      deps
+    );
+  }
+}
+
+test("signature input contract keeps top_p numeric", () => {
+  const { deps } = makeDeps();
+  assertNumericSignatureInputs(deps);
+});
+
 test("happy path → stores cleaned body (no _streamed), tokens = prompt + completion", () => {
   const { deps, stored } = makeDeps();
   storeStreamingSemanticCacheResponse(baseArgs(), deps);
@@ -51,6 +79,8 @@ test("happy path → stores cleaned body (no _streamed), tokens = prompt + compl
   assert.equal(stored[0].tokens, 20);
   assert.equal("_streamed" in stored[0].body, false);
   assert.equal(stored[0].body.id, "resp-1");
+  const signatureArgs = JSON.parse(String(stored[0].sig).slice("sig:".length)) as unknown[];
+  assert.deepEqual(signatureArgs.slice(2, 4), [0, 1]);
 });
 
 test("non-200 stream status → no store", () => {

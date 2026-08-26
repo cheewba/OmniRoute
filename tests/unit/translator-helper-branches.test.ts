@@ -8,8 +8,12 @@ const geminiHelper = await import("../../open-sse/translator/helpers/geminiHelpe
 const toolCallHelper = await import("../../open-sse/translator/helpers/toolCallHelper.ts");
 const { FORMATS } = await import("../../open-sse/translator/formats.ts");
 const { translateRequest } = await import("../../open-sse/translator/index.ts");
-const { cacheReasoningByKey, clearReasoningCacheAll, getReasoningCacheServiceStats } =
-  await import("../../open-sse/services/reasoningCache.ts");
+const {
+  buildAssistantMessageCacheKey,
+  cacheReasoningByKey,
+  clearReasoningCacheAll,
+  getReasoningCacheServiceStats,
+} = await import("../../open-sse/services/reasoningCache.ts");
 const { clearModelsDevCapabilities, saveModelsDevCapabilities } =
   await import("../../src/lib/modelsDevSync.ts");
 
@@ -259,6 +263,14 @@ test("openaiHelper keeps unmatched tool choices and deletes empty tools arrays",
 test("claudeHelper validates content, ordering and request preparation branches", () => {
   assert.equal(claudeHelper.hasValidContent({ content: " hello " }), true);
   assert.equal(claudeHelper.hasValidContent({ content: [{ type: "tool_use", id: "call" }] }), true);
+  assert.equal(
+    claudeHelper.hasValidContent({ content: [{ type: "thinking", thinking: "reasoning" }] }),
+    true
+  );
+  assert.equal(
+    claudeHelper.hasValidContent({ content: [{ type: "redacted_thinking", data: "opaque" }] }),
+    true
+  );
   assert.equal(claudeHelper.hasValidContent({ content: [{ type: "text", text: "   " }] }), false);
 
   assert.deepEqual(claudeHelper.fixToolUseOrdering([{ role: "user", content: "single" }]), [
@@ -631,8 +643,13 @@ test("translateRequest replays cached reasoning-only messages when interleaved f
       }),
     },
   });
+  const scope = "api-key:test:session:helper-deepseek";
+  const messages = [
+    { role: "user", content: "solve this" },
+    { role: "assistant", content: "answer", reasoning_content: "" },
+  ];
   cacheReasoningByKey(
-    "request:req_reasoning_only:message:0",
+    buildAssistantMessageCacheKey(scope, messages, 1),
     "deepseek",
     "deepseek-v4-flash",
     "cached reasoning only"
@@ -642,16 +659,12 @@ test("translateRequest replays cached reasoning-only messages when interleaved f
     FORMATS.OPENAI,
     FORMATS.OPENAI,
     "deepseek-v4-flash",
-    {
-      _reasoningCacheRequestId: "req_reasoning_only",
-      messages: [
-        { role: "user", content: "solve this" },
-        { role: "assistant", content: "answer", reasoning_content: "" },
-      ],
-    },
+    { messages },
     false,
     null,
-    "deepseek"
+    "deepseek",
+    null,
+    { reasoningCacheScope: scope }
   );
 
   assert.equal(result.messages[1].reasoning_content, "cached reasoning only");
@@ -662,27 +675,28 @@ test("translateRequest replays cached reasoning-only messages when interleaved f
 
 test("translateRequest does not replay reasoning-only messages for non-DeepSeek models", () => {
   clearReasoningCacheAll();
+  const scope = "api-key:test:session:helper-kimi";
+  const messages = [
+    { role: "user", content: "solve this" },
+    { role: "assistant", content: "answer", reasoning_content: "" },
+  ];
   cacheReasoningByKey(
-    "request:req_kimi_reasoning_only:message:0",
+    buildAssistantMessageCacheKey(scope, messages, 1),
     "kimi",
-    "kimi-k2.5",
+    "kimi-k2.6",
     "cached kimi reasoning"
   );
 
   const result = translateRequest(
     FORMATS.OPENAI,
     FORMATS.OPENAI,
-    "kimi-k2.5",
-    {
-      _reasoningCacheRequestId: "req_kimi_reasoning_only",
-      messages: [
-        { role: "user", content: "solve this" },
-        { role: "assistant", content: "answer", reasoning_content: "" },
-      ],
-    },
+    "kimi-k2.6",
+    { messages },
     false,
     null,
-    "kimi"
+    "kimi",
+    null,
+    { reasoningCacheScope: scope }
   );
 
   assert.equal(result.messages[1].reasoning_content, undefined);
@@ -690,22 +704,12 @@ test("translateRequest does not replay reasoning-only messages for non-DeepSeek 
   clearReasoningCacheAll();
 });
 
-test("translateRequest injects thinking block into Claude-format messages for Kimi K2 reasoning models", () => {
+test("translateRequest replays cached reasoning before Kimi Coding's empty fallback", () => {
   clearReasoningCacheAll();
-  clearModelsDevCapabilities();
-  saveModelsDevCapabilities({
-    "kimi-coding": {
-      "kimi-k2.5": buildCapability({
-        interleaved_field: "reasoning_content",
-        reasoning: true,
-        tool_call: true,
-      }),
-    },
-  });
   cacheReasoningByKey(
     "toolu_kimi_claude",
-    "kimi-coding",
-    "kimi-k2.5",
+    "kimi-coding-apikey",
+    "k3-256k",
     "cached thinking for Kimi tool call"
   );
 
@@ -714,9 +718,9 @@ test("translateRequest injects thinking block into Claude-format messages for Ki
   const result = translateRequest(
     FORMATS.OPENAI,
     FORMATS.CLAUDE,
-    "kimi-k2.5",
+    "k3-256k",
     {
-      thinking: { type: "enabled", budget_tokens: 2000 },
+      reasoning_effort: "high",
       messages: [
         { role: "user", content: "read the file" },
         {
@@ -735,21 +739,16 @@ test("translateRequest injects thinking block into Claude-format messages for Ki
     },
     false,
     null,
-    "kimi-coding"
+    "kimi-coding-apikey"
   );
 
   const assistantMsg = result.messages.find((m) => m.role === "assistant");
   assert.ok(assistantMsg, "assistant message should exist");
   assert.ok(Array.isArray(assistantMsg.content), "content should be array");
 
-  // Should have a thinking block injected before tool_use
   const thinkingBlock = assistantMsg.content.find((b) => b?.type === "thinking");
   assert.ok(thinkingBlock, "thinking block should be injected");
-  assert.equal(
-    thinkingBlock.thinking,
-    "cached thinking for Kimi tool call",
-    "should use cached reasoning"
-  );
+  assert.equal(thinkingBlock.thinking, "cached thinking for Kimi tool call");
 
   // Thinking block should appear before tool_use
   const thinkingIdx = assistantMsg.content.indexOf(thinkingBlock);
@@ -757,30 +756,18 @@ test("translateRequest injects thinking block into Claude-format messages for Ki
   assert.ok(thinkingIdx < toolUseIdx, "thinking block should be before tool_use");
 
   assert.equal(getReasoningCacheServiceStats().replays, 1);
-  clearModelsDevCapabilities();
   clearReasoningCacheAll();
 });
 
-test("translateRequest injects placeholder thinking block for Claude-format Kimi K2 on cache miss", () => {
+test("translateRequest uses an empty Kimi Coding thinking marker on cache miss", () => {
   clearReasoningCacheAll();
-  clearModelsDevCapabilities();
-  saveModelsDevCapabilities({
-    "kimi-coding": {
-      "kimi-k2.6": buildCapability({
-        interleaved_field: "reasoning_content",
-        reasoning: true,
-        tool_call: true,
-      }),
-    },
-  });
 
-  // No cache seeded - should fall back to placeholder
   const result = translateRequest(
     FORMATS.OPENAI,
     FORMATS.CLAUDE,
-    "kimi-k2.6",
+    "k3-256k",
     {
-      thinking: { type: "enabled", budget_tokens: 2000 },
+      reasoning_effort: "high",
       messages: [
         { role: "user", content: "do it" },
         {
@@ -792,7 +779,7 @@ test("translateRequest injects placeholder thinking block for Claude-format Kimi
     },
     false,
     null,
-    "kimi-coding"
+    "kimi-coding-apikey"
   );
 
   const assistantMsg = result.messages.find((m) => m.role === "assistant");
@@ -801,33 +788,24 @@ test("translateRequest injects placeholder thinking block for Claude-format Kimi
   const thinkingBlock =
     Array.isArray(assistantMsg.content) && assistantMsg.content.find((b) => b?.type === "thinking");
   assert.ok(thinkingBlock, "thinking block should be injected on cache miss");
-  // Must be non-empty for kimi-coding
-  assert.ok(
-    thinkingBlock.thinking && thinkingBlock.thinking.length > 0,
-    "placeholder must be non-empty"
-  );
+  assert.equal(thinkingBlock.thinking, "");
 
-  clearModelsDevCapabilities();
   clearReasoningCacheAll();
 });
 
 test("translateRequest does NOT inject duplicate thinking for Claude-format messages with existing thinking block", () => {
   clearReasoningCacheAll();
-  clearModelsDevCapabilities();
-  saveModelsDevCapabilities({
-    "kimi-coding": {
-      "kimi-k2.5": buildCapability({
-        interleaved_field: "reasoning_content",
-        reasoning: true,
-        tool_call: true,
-      }),
-    },
-  });
+  cacheReasoningByKey(
+    "toolu_existing",
+    "kimi-coding-apikey",
+    "k3-256k",
+    "cached thinking must not replace client thinking"
+  );
 
   const result = translateRequest(
     FORMATS.OPENAI,
     FORMATS.CLAUDE,
-    "kimi-k2.5",
+    "k3-256k",
     {
       messages: [
         { role: "user", content: "hi" },
@@ -843,7 +821,7 @@ test("translateRequest does NOT inject duplicate thinking for Claude-format mess
     },
     false,
     null,
-    "kimi-coding"
+    "kimi-coding-apikey"
   );
 
   const assistantMsg = result.messages.find((m) => m.role === "assistant");
@@ -856,7 +834,7 @@ test("translateRequest does NOT inject duplicate thinking for Claude-format mess
     "I already have this",
     "original thinking should be preserved"
   );
+  assert.equal(getReasoningCacheServiceStats().replays, 0);
 
-  clearModelsDevCapabilities();
   clearReasoningCacheAll();
 });

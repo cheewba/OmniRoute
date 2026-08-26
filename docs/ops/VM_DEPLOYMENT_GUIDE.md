@@ -422,3 +422,14 @@ See also [TUNNELS_GUIDE.md](./TUNNELS_GUIDE.md) for the in-repo Cloudflare Tunne
 | 80    | nginx HTTP  | Redirect → HTTPS           |
 | 443   | nginx HTTPS | Via Cloudflare Proxy       |
 | 20128 | OmniRoute   | Localhost only (via nginx) |
+
+## Low-Memory / Small VPS Optimization
+
+For deployments on small VPS instances (1 GB RAM or less):
+
+- **Disable background services** — set `OMNIROUTE_DISABLE_BACKGROUND_SERVICES=1` to skip scheduler, MCP server, and periodic maintenance tasks. See `docs/reference/ENVIRONMENT.md`.
+- **Use SQLite WAL mode** — enabled by default, reduces peak memory during concurrent reads.
+- **Cap the V8 heap** — set `OMNIROUTE_MEMORY_MB` (e.g. `512`) so the runtime does not calibrate a ceiling larger than the VM. See `docs/reference/ENVIRONMENT.md`.
+- **Heavyweight admission auto-scales with the heap cap** -- once `OMNIROUTE_MEMORY_MB` is set above, the ingest byte budget (`OMNIROUTE_CHAT_MAX_INFLIGHT_BYTES`) derives itself from that same ceiling, so a memory-constrained VM already gets a smaller concurrent-request budget with no extra tuning; excess requests get a retryable `503` with `Retry-After` instead of competing for memory. Set the legacy `OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT` request-count cap only if you need a hard ceiling on top of that.
+- **Avoid `next build` on the VPS** — build locally and deploy the standalone output (`.next/standalone/`).
+- **Monitor with `top` / `free -m`** — OmniRoute typically uses 200-400 MB RSS at idle on a 1 GB VM.

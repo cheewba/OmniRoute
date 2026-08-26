@@ -57,7 +57,7 @@ test("port did not regress previously curated openai/gemini ids", () => {
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-3.1-pro-preview",
-    "gemini-3.5-flash",
+    "gemini-3.7-flash",
   ] as const) {
     assert.ok(geminiIds.has(id), `existing gemini model ${id} must remain`);
   }

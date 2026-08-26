@@ -1,8 +1,9 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useTranslations } from "next-intl";
 import { SkillsConceptCard } from "@/shared/components/SkillsConceptCard";
+import { matchesSearch } from "@/shared/utils/turkishText";
 import { CoverageBar } from "./components/CoverageBar";
 import { McpA2aLinksBar } from "./components/McpA2aLinksBar";
 import { SkillCard } from "./components/SkillCard";
@@ -29,6 +30,10 @@ function SkillCardSkeleton(): JSX.Element {
 function CoverageBarSkeleton(): JSX.Element {
   return (
     <div className="space-y-2 animate-pulse">
+      <div className="flex gap-2">
+        <div className="h-2 w-16 rounded bg-bg-subtle" />
+        <div className="flex-1 h-2 rounded bg-bg-subtle" />
+      </div>
       <div className="flex gap-2">
         <div className="h-2 w-16 rounded bg-bg-subtle" />
         <div className="flex-1 h-2 rounded bg-bg-subtle" />
@@ -161,22 +166,39 @@ export function AgentSkillsPageClient(): JSX.Element {
   }, [t]);
 
   // ── Filtering + search ────────────────────────────────────────────────────
-  const filteredSkills = catalog.filter((s) => {
+  const localizedCatalog = useMemo(
+    () =>
+      catalog.map((skill) => {
+        const nameKey = `catalog.${skill.id}.name`;
+        const descriptionKey = `catalog.${skill.id}.description`;
+        return {
+          ...skill,
+          name: t.has(nameKey) ? t(nameKey) : skill.name,
+          description: t.has(descriptionKey) ? t(descriptionKey) : skill.description,
+        };
+      }),
+    [catalog, t]
+  );
+
+  const filteredSkills = localizedCatalog.filter((s) => {
     if (filter !== "all" && s.category !== filter) return false;
     if (searchTerm.trim()) {
-      const q = searchTerm.toLowerCase();
       return (
-        s.name.toLowerCase().includes(q) ||
-        s.description.toLowerCase().includes(q) ||
-        s.id.toLowerCase().includes(q)
+        matchesSearch(s.name, searchTerm) ||
+        matchesSearch(s.description, searchTerm) ||
+        matchesSearch(s.id, searchTerm)
       );
     }
     return true;
   });
 
   const selectedMarkdown = selectedId ? (markdownCache.get(selectedId) ?? null) : null;
-  const coverageTotal = coverage !== null ? coverage.api.have + coverage.cli.have : null;
-  const showGenerateButton = coverageTotal !== null && coverageTotal < 42;
+  const coverageTotal =
+    coverage !== null ? coverage.api.have + coverage.cli.have + coverage.config.have : null;
+  const catalogTotal =
+    coverage !== null ? coverage.api.total + coverage.cli.total + coverage.config.total : null;
+  const showGenerateButton =
+    coverageTotal !== null && catalogTotal !== null && coverageTotal < catalogTotal;
 
   return (
     <div className="flex flex-col gap-4">

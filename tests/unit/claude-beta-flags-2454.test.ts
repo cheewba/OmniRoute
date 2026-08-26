@@ -56,6 +56,12 @@ test("#2454 Opus full-agent includes context-1m and mid-conversation-system", ()
   );
 });
 
+test("Opus 5 full-agent omits the legacy context-1m beta", () => {
+  const flags = selectBetaFlags(fullAgentBody("claude-opus-5"));
+  assert.ok(!flags.includes("context-1m-2025-08-07"));
+  assert.ok(flags.includes("mid-conversation-system-2026-04-07"));
+});
+
 test("#2454 explicit model arg overrides body.model for tiering", () => {
   // body says sonnet, but the resolved upstream model is haiku → must omit context-1m
   const flags = selectBetaFlags(fullAgentBody("claude-sonnet-4-6"), "claude-haiku-4-5-20251001");

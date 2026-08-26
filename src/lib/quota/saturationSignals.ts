@@ -279,10 +279,21 @@ function codexWindowKey(window: QuotaWindow): string {
   }
 }
 
-async function fetchCodexSaturation(connectionId: string, dim: DimensionSpec): Promise<number> {
+async function fetchCodexSaturation(
+  connectionId: string,
+  dim: DimensionSpec,
+  connection?: Record<string, unknown>
+): Promise<number> {
   // Dynamic import — codexQuotaFetcher lives in open-sse workspace
   const mod = await import("@omniroute/open-sse/services/codexQuotaFetcher");
-  const quota = await mod.fetchCodexQuota(connectionId);
+  // #6379: pass the loaded connection snapshot through so fetchCodexQuota can
+  // read its accessToken/workspaceId even when this connection was never
+  // registered via registerCodexConnection() (e.g. during headroom ranking,
+  // which runs BEFORE any request is dispatched for the candidate). Without
+  // this, fetchCodexQuota returns null for every candidate and saturation
+  // fails open to 0 across the board — headroom then can't tell accounts
+  // apart and keeps the original combo order.
+  const quota = await mod.fetchCodexQuota(connectionId, connection);
   if (!quota) return 0;
 
   const winKey = codexWindowKey(dim.window);
@@ -352,13 +363,13 @@ export function __setAnthropicSaturationDepsForTests(deps: AnthropicSaturationDe
 }
 
 async function defaultAnthropicDeps(): Promise<AnthropicSaturationDeps> {
-  const [providersMod, usageMod] = await Promise.all([
-    import("@/lib/db/providers"),
+  const [localDbMod, usageMod] = await Promise.all([
+    import("@/lib/localDb"),
     import("@omniroute/open-sse/services/usage"),
   ]);
   return {
     loadConnection: (connectionId) =>
-      providersMod.getProviderConnectionById(connectionId) as Promise<Record<
+      localDbMod.getCachedProviderConnectionById(connectionId) as Promise<Record<
         string,
         unknown
       > | null>,
@@ -473,6 +484,17 @@ async function fetchGenericSaturation(connectionId: string, provider: string): P
     const result = await fetcher(connectionId, provider);
     if (result && typeof result === "object") {
       const obj = result as Record<string, unknown>;
+
+      // Prefer the normalized quota shape (handles nested `quotas` map for
+      // Antigravity / Claude / etc.). Fall back to legacy top-level fields.
+      const { convertUsageToQuotaInfo } = await import(
+        "@omniroute/open-sse/services/genericQuotaFetcher"
+      );
+      const quota = convertUsageToQuotaInfo(result);
+      if (quota && Number.isFinite(quota.percentUsed)) {
+        return Math.min(1, Math.max(0, quota.percentUsed));
+      }
+
       const pct =
         typeof obj.percentUsed === "number"
           ? obj.percentUsed
@@ -507,7 +529,8 @@ async function fetchGenericSaturation(connectionId: string, provider: string): P
 export async function getSaturation(
   connectionId: string,
   provider: string,
-  dim: DimensionSpec
+  dim: DimensionSpec,
+  connection?: Record<string, unknown>
 ): Promise<number> {
   const key = cacheKey(connectionId, provider, dim);
   const cached = _cache.get(key);
@@ -519,7 +542,7 @@ export async function getSaturation(
   try {
     switch (provider) {
       case "codex":
-        value = await fetchCodexSaturation(connectionId, dim);
+        value = await fetchCodexSaturation(connectionId, dim, connection);
         break;
       case "bailian":
         value = await fetchBailianSaturation(connectionId, dim);

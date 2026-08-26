@@ -151,14 +151,14 @@ test("updatePool without connectionIds leaves join rows untouched", () => {
 
 // ── D1.4: deletePool removes join rows ────────────────────────────────────
 
-test("deletePool removes quota_pool_connections rows", () => {
+test("deletePool removes quota_pool_connections rows", async () => {
   const pool = poolsDb.createPool({
     connectionId: "del-a",
     name: "To Delete",
     connectionIds: ["del-a", "del-b"],
   });
 
-  const deleted = poolsDb.deletePool(pool.id);
+  const deleted = await poolsDb.deletePool(pool.id);
   assert.equal(deleted, true, "deletePool should return true");
 
   // Pool should be gone.
@@ -198,7 +198,7 @@ test("listPools returns connectionIds on every pool", () => {
     connectionIds: ["lc-2", "lc-3"],
   });
 
-  const pools = poolsDb.listPools();
+  const { items: pools } = poolsDb.listPools();
   assert.equal(pools.length, 2);
 
   const p1 = pools.find((p) => p.name === "Pool 1")!;

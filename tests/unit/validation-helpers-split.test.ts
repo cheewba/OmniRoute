@@ -44,6 +44,10 @@ test("urlHelpers: normalizeBaseUrl trims + strips trailing slash; addModelsSuffi
     "https://api.x.com/v1/models"
   );
   assert.equal(urls.addModelsSuffix("https://api.x.com/v1/models"), "https://api.x.com/v1/models");
+  assert.equal(
+    urls.addModelsSuffix("https://api.kimi.com/coding/v1/messages?beta=true"),
+    "https://api.kimi.com/coding/v1/models"
+  );
 });
 
 test("headers: buildBearerHeaders sets Authorization; builders vary the scheme", () => {

@@ -1,4 +1,5 @@
 "use client";
+import { useTranslations } from "next-intl";
 import type { DiffSegment } from "./compressionFlowModel";
 export interface DiffPaneProps {
   segments: DiffSegment[];
@@ -10,17 +11,18 @@ const SEG_CLASS: Record<DiffSegment["type"], string> = {
   added: "bg-green-500/20",
 };
 export function DiffPane({ segments, preservedBlocks }: DiffPaneProps) {
+  const t = useTranslations("compressionStudio");
   return (
     <div data-testid="diff-pane" className="font-mono text-xs leading-relaxed">
       <div className="mb-2 flex gap-2 text-[10px]">
-        <span className="rounded bg-blue-500/20 px-2 py-0.5">inline</span>
+        <span className="rounded bg-blue-500/20 px-2 py-0.5">{t("inlineView")}</span>
         <button
           type="button"
           disabled
-          title="split view em breve"
+          title={t("splitComingSoon")}
           className="rounded px-2 py-0.5 opacity-40"
         >
-          split (em breve)
+          {t("splitComingSoon")}
         </button>
       </div>
       <div className="whitespace-pre-wrap">

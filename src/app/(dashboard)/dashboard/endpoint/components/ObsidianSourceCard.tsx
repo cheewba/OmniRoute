@@ -63,7 +63,7 @@ export default function ObsidianSourceCard() {
 
   const handleSaveToken = async () => {
     if (!token.trim()) {
-      setMessage({ type: "error", text: "Please enter an Obsidian API token" });
+      setMessage({ type: "error", text: t("obsidianEnterToken") });
       return;
     }
     setBusy(true);
@@ -83,11 +83,14 @@ export default function ObsidianSourceCard() {
         setConnected(true);
         setMessage({ type: "success", text: data.message });
       } else {
-        setMessage({ type: "error", text: data.error ?? "Failed to connect" });
+        setMessage({ type: "error", text: data.error ?? t("obsidianConnectFailed") });
         setConnected(false);
       }
     } catch (err) {
-      setMessage({ type: "error", text: err instanceof Error ? err.message : "Connection failed" });
+      setMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : t("obsidianConnectionFailed"),
+      });
     } finally {
       setBusy(false);
     }
@@ -105,10 +108,13 @@ export default function ObsidianSourceCard() {
         setBaseUrl(DEFAULT_URL);
         setMessage({ type: "success", text: data.message });
       } else {
-        setMessage({ type: "error", text: data.error ?? "Failed to disconnect" });
+        setMessage({ type: "error", text: data.error ?? t("obsidianDisconnectFailed") });
       }
     } catch (err) {
-      setMessage({ type: "error", text: err instanceof Error ? err.message : "Disconnect failed" });
+      setMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : t("obsidianDisconnectFailed"),
+      });
     } finally {
       setBusy(false);
     }
@@ -116,7 +122,7 @@ export default function ObsidianSourceCard() {
 
   const handleEnableWebdav = async () => {
     if (!vaultPath.trim()) {
-      setMessage({ type: "error", text: "Please enter the vault directory path" });
+      setMessage({ type: "error", text: t("obsidianEnterVaultPath") });
       return;
     }
     setWebdavBusy(true);
@@ -132,17 +138,14 @@ export default function ObsidianSourceCard() {
         setWebdavEnabled(true);
         setWebdavUsername(data.username);
         setWebdavPassword(data.password);
-        setMessage({
-          type: "success",
-          text: "WebDAV sync enabled. Configure your mobile device below.",
-        });
+        setMessage({ type: "success", text: t("obsidianWebdavEnabledMessage") });
       } else {
-        setMessage({ type: "error", text: data.error ?? "Failed to enable WebDAV" });
+        setMessage({ type: "error", text: data.error ?? t("obsidianEnableWebdavFailed") });
       }
     } catch (err) {
       setMessage({
         type: "error",
-        text: err instanceof Error ? err.message : "Failed to enable WebDAV",
+        text: err instanceof Error ? err.message : t("obsidianEnableWebdavFailed"),
       });
     } finally {
       setWebdavBusy(false);
@@ -159,14 +162,14 @@ export default function ObsidianSourceCard() {
         setWebdavEnabled(false);
         setWebdavUsername(null);
         setWebdavPassword(null);
-        setMessage({ type: "success", text: "WebDAV sync disabled" });
+        setMessage({ type: "success", text: t("obsidianWebdavDisabledMessage") });
       } else {
-        setMessage({ type: "error", text: data.error ?? "Failed to disable WebDAV" });
+        setMessage({ type: "error", text: data.error ?? t("obsidianDisableWebdavFailed") });
       }
     } catch (err) {
       setMessage({
         type: "error",
-        text: err instanceof Error ? err.message : "Failed to disable WebDAV",
+        text: err instanceof Error ? err.message : t("obsidianDisableWebdavFailed"),
       });
     } finally {
       setWebdavBusy(false);
@@ -203,20 +206,18 @@ export default function ObsidianSourceCard() {
             <div className="flex items-center gap-2 flex-wrap">
               <span className="font-semibold text-sm">Obsidian</span>
               <Badge variant={connected ? "success" : "default"}>
-                {connected ? "Connected" : "Not connected"}
+                {connected ? t("obsidianConnected") : t("obsidianNotConnected")}
               </Badge>
               {webdavEnabled && (
                 <Badge
                   variant="success"
                   className="bg-blue-500/20 text-blue-400 border-blue-500/30"
                 >
-                  WebDAV Sync
+                  {t("obsidianWebdavSync")}
                 </Badge>
               )}
             </div>
-            <p className="text-xs text-text-muted mt-0.5">
-              Search, read, write, and manage notes in Obsidian through routed AI models
-            </p>
+            <p className="text-xs text-text-muted mt-0.5">{t("obsidianDescription")}</p>
           </div>
           <span
             className={`material-symbols-outlined text-text-muted text-lg transition-transform ${expanded ? "rotate-180" : ""}`}
@@ -245,23 +246,23 @@ export default function ObsidianSourceCard() {
             {!connected ? (
               <div className="flex flex-col gap-2">
                 <label className="text-xs text-text-muted font-medium">
-                  Obsidian Local REST API Token
+                  {t("obsidianRestToken")}
                 </label>
                 <div className="flex gap-2">
                   <Input
                     type="password"
                     value={token}
                     onChange={(e) => setToken(e.target.value)}
-                    placeholder="Obsidian API key"
+                    placeholder={t("obsidianApiKeyPlaceholder")}
                     disabled={busy}
                     className="font-mono text-sm flex-1"
                   />
                   <Button onClick={handleSaveToken} loading={busy} variant="primary" size="sm">
-                    Connect
+                    {t("obsidianConnect")}
                   </Button>
                 </div>
                 <label className="text-xs text-text-muted font-medium mt-1">
-                  Base URL (optional)
+                  {t("obsidianBaseUrlOptional")}
                 </label>
                 <Input
                   type="text"
@@ -274,23 +275,18 @@ export default function ObsidianSourceCard() {
                 {baseUrl.includes(":27124") && (
                   <div className="flex items-center gap-1.5 rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-2.5 py-1.5 text-[10px] text-yellow-300">
                     <span className="material-symbols-outlined text-[14px]">warning</span>
-                    <span>
-                      Port 27124 is the MCP endpoint (HTTPS, self-signed cert). The REST API uses
-                      HTTP on port 27123.
-                    </span>
+                    <span>{t("obsidianPortWarning")}</span>
                   </div>
                 )}
                 <p className="text-[10px] text-text-muted">
-                  Default: {DEFAULT_URL}. For remote vaults, enter the Tailscale IP + port (e.g.,
-                  http://100.x.x.x:27123). Enable the Local REST API plugin on the machine running
-                  Obsidian.
+                  {t("obsidianRemoteVaultHint", { defaultUrl: DEFAULT_URL })}
                 </p>
               </div>
             ) : (
               <div className="flex flex-col gap-3">
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-text-muted flex-1">
-                    Token configured. Obsidian tools are available via MCP.
+                    {t("obsidianTokenConfigured")}
                   </span>
                   <Button
                     onClick={handleDisconnect}
@@ -299,23 +295,22 @@ export default function ObsidianSourceCard() {
                     size="sm"
                     className="border-red-500/30! text-red-400! hover:bg-red-500/10!"
                   >
-                    Disconnect
+                    {t("obsidianDisconnect")}
                   </Button>
                 </div>
 
                 <div className="border-t border-border/50 pt-3 flex flex-col gap-2">
                   <div className="flex items-center gap-2">
-                    <span className="text-xs text-text-muted font-medium">Vault Sync (WebDAV)</span>
+                    <span className="text-xs text-text-muted font-medium">
+                      {t("obsidianVaultSync")}
+                    </span>
                   </div>
-                  <p className="text-[10px] text-text-muted">
-                    Sync your vault to Obsidian mobile using WebDAV over Tailscape. Obsidian mobile
-                    has built-in WebDAV support — no plugins needed.
-                  </p>
+                  <p className="text-[10px] text-text-muted">{t("obsidianVaultSyncDescription")}</p>
 
                   {!webdavEnabled ? (
                     <div className="flex flex-col gap-2">
                       <label className="text-xs text-text-muted font-medium">
-                        Vault Directory Path
+                        {t("obsidianVaultDirectoryPath")}
                       </label>
                       <div className="flex gap-2">
                         <Input
@@ -332,7 +327,7 @@ export default function ObsidianSourceCard() {
                           variant="primary"
                           size="sm"
                         >
-                          Enable
+                          {t("obsidianEnable")}
                         </Button>
                       </div>
                     </div>
@@ -343,7 +338,9 @@ export default function ObsidianSourceCard() {
                           cloud_sync
                         </span>
                         <div className="flex-1 min-w-0">
-                          <p className="text-xs text-blue-300 font-medium">WebDAV sync enabled</p>
+                          <p className="text-xs text-blue-300 font-medium">
+                            {t("obsidianWebdavEnabled")}
+                          </p>
                           <p className="text-[10px] text-blue-400/70 font-mono truncate">
                             {getWebdavUrl()}
                           </p>
@@ -355,21 +352,21 @@ export default function ObsidianSourceCard() {
                           size="sm"
                           className="border-red-500/30! text-red-400! hover:bg-red-500/10! shrink-0"
                         >
-                          Disable
+                          {t("obsidianDisable")}
                         </Button>
                       </div>
 
                       <div className="flex flex-col gap-2 rounded-lg border border-border/50 bg-black/10 p-3">
                         <p className="text-[11px] text-text-muted font-medium">
-                          Configure Obsidian Mobile
+                          {t("obsidianConfigureMobile")}
                         </p>
                         <p className="text-[10px] text-text-muted">
-                          In Obsidian mobile: Settings → Sync → WebDAV → enter the following:
+                          {t("obsidianMobileInstructions")}
                         </p>
 
                         <div className="flex flex-col gap-1.5">
                           <label className="text-[10px] text-text-muted font-medium">
-                            WebDAV URL
+                            {t("obsidianWebdavUrl")}
                           </label>
                           <div className="flex items-center gap-1.5 rounded border border-border/30 bg-black/20 px-2.5 py-1.5">
                             <code className="text-[10px] text-text-muted font-mono flex-1 break-all select-all">
@@ -380,7 +377,7 @@ export default function ObsidianSourceCard() {
 
                         <div className="flex flex-col gap-1.5">
                           <label className="text-[10px] text-text-muted font-medium">
-                            Username
+                            {t("obsidianUsername")}
                           </label>
                           <div className="flex items-center gap-1.5 rounded border border-border/30 bg-black/20 px-2.5 py-1.5">
                             <code className="text-[10px] text-text-muted font-mono flex-1 select-all">
@@ -391,7 +388,7 @@ export default function ObsidianSourceCard() {
 
                         <div className="flex flex-col gap-1.5">
                           <label className="text-[10px] text-text-muted font-medium">
-                            Password
+                            {t("obsidianPassword")}
                           </label>
                           <div className="flex items-center gap-1.5">
                             <div className="flex items-center gap-1.5 rounded border border-border/30 bg-black/20 px-2.5 py-1.5 flex-1">
@@ -412,10 +409,7 @@ export default function ObsidianSourceCard() {
                           </div>
                         </div>
 
-                        <p className="text-[10px] text-text-muted">
-                          Use your Tailscale IP instead of localhost if connecting from mobile. Both
-                          devices must be on the same Tailscale network.
-                        </p>
+                        <p className="text-[10px] text-text-muted">{t("obsidianTailscaleHint")}</p>
                       </div>
                     </div>
                   )}

@@ -149,6 +149,37 @@ test("#5085 empty-content 502 must NOT mark the provider/connection exhausted (m
   );
 });
 
+test("#8397 empty-response 502 (no usable choices/output) must NOT mark provider/connection exhausted", () => {
+  const sets = freshSets();
+  const providerExhausted = applyComboTargetExhaustion(
+    makeTarget("nvidia", "nvidia/minimaxai/minimax-m3"),
+    {
+      result: { status: 502, headers: new Headers() },
+      fallbackResult: { reason: "server_error" },
+      errorText: "upstream returned an empty response without usable output",
+      rawModel: "minimaxai/minimax-m3",
+      isTokenLimitBreach: false,
+      allAccountsRateLimited: false,
+      sets,
+      log,
+      tag: "COMBO",
+      exhaustedLogLevel: "info",
+    }
+  );
+
+  assert.equal(providerExhausted, false, "empty-response is not a quota exhaustion");
+  assert.equal(
+    sets.exhaustedProviders.has("nvidia"),
+    false,
+    "empty-response 502 must NOT mark the whole provider exhausted"
+  );
+  assert.equal(
+    sets.exhaustedConnections.size,
+    0,
+    "empty-response 502 must NOT mark any connection exhausted"
+  );
+});
+
 test("#5085 a real connection-level 502 (gateway error) STILL marks the provider exhausted", () => {
   const sets = freshSets();
   applyComboTargetExhaustion(makeTarget("nvidia", "nvidia/minimaxai/minimax-m3"), {

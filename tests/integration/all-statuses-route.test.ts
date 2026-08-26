@@ -31,6 +31,7 @@ const allStatusesRoute = await import("../../src/app/api/cli-tools/all-statuses/
 
 // Import CLI_TOOLS to know how many tools exist
 const { CLI_TOOLS } = await import("../../src/shared/constants/cliTools.ts");
+const { getCliPrimaryConfigPath } = await import("../../src/shared/services/cliRuntime.ts");
 
 const TOOL_COUNT = Object.keys(CLI_TOOLS).length;
 
@@ -233,4 +234,60 @@ test("cache miss: different mtime forces re-execution (cache not used)", async (
   const body = (await response.json()) as Record<string, Record<string, unknown>>;
   // The entry should exist — fresh execution was performed (no crash)
   assert.ok(toolId in body, `expected ${toolId} after cache miss re-execution`);
+});
+
+test("refresh=true bypasses a matching cached CLI result", async () => {
+  const toolId = "codex";
+  const cachedVersion = "stale-codex-version-from-cache";
+  const configPath = getCliPrimaryConfigPath(toolId);
+  const mtimeMs = configPath && fs.existsSync(configPath) ? fs.statSync(configPath).mtimeMs : 0;
+  setCached(toolId, mtimeMs, {
+    detection: { installed: true, runnable: true, version: cachedVersion },
+    config: { status: "configured" },
+  });
+
+  const response = await allStatusesRoute.GET(
+    new Request("http://localhost/api/cli-tools/all-statuses?refresh=true")
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as Record<string, { detection?: { version?: string } }>;
+  assert.notEqual(body[toolId]?.detection?.version, cachedVersion);
+});
+
+test("grok-build status uses GROK_HOME and returns its managed endpoint", async () => {
+  const grokHome = fs.mkdtempSync(path.join(os.tmpdir(), "all-statuses-grok-home-"));
+  const original = process.env.GROK_HOME;
+  process.env.GROK_HOME = grokHome;
+  try {
+    fs.writeFileSync(
+      path.join(grokHome, "config.toml"),
+      [
+        "[models]",
+        'default = "omniroute"',
+        "",
+        "[model.omniroute]",
+        'model = "openai/gpt-5.5"',
+        'base_url = "https://gateway.example/v1"',
+        'api_backend = "chat_completions"',
+        "",
+      ].join("\n")
+    );
+    const response = await allStatusesRoute.GET(
+      new Request("http://localhost/api/cli-tools/all-statuses?refresh=true")
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as Record<
+      string,
+      { config?: { status?: string; endpoint?: string | null } }
+    >;
+    if (body["grok-build"]?.config?.status !== "not_installed") {
+      assert.equal(body["grok-build"]?.config?.status, "configured");
+    }
+    assert.equal(body["grok-build"]?.config?.endpoint, "https://gateway.example/v1");
+  } finally {
+    if (original === undefined) delete process.env.GROK_HOME;
+    else process.env.GROK_HOME = original;
+    fs.rmSync(grokHome, { recursive: true, force: true });
+  }
 });

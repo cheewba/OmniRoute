@@ -8,15 +8,12 @@ const SINGLE_MODE_OF: Record<string, string> = {
   aggressive: "aggressive",
   ultra: "ultra",
   rtk: "rtk",
+  "codex-responses": "codex-responses",
+  omniglyph: "omniglyph",
 };
 
 export type CompressionSource =
-  | "request-header"
-  | "routing-override"
-  | "active-profile"
-  | "auto-trigger"
-  | "default"
-  | "off";
+  "request-header" | "routing-override" | "active-profile" | "auto-trigger" | "default" | "off";
 
 export interface DerivedPlan {
   mode: string;

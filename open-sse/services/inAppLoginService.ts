@@ -32,6 +32,20 @@ interface ActiveLogin {
   aborted: boolean;
 }
 
+export function captureConfiguredHeaders(
+  tokenSources: readonly TokenSource[],
+  requestHeaders: Record<string, string>,
+  credentials: Record<string, string>
+): void {
+  for (const source of tokenSources) {
+    if (source.type !== "header" || credentials[source.name]) continue;
+    const value = requestHeaders[source.name.toLowerCase()];
+    if (typeof value === "string" && value.trim()) {
+      credentials[source.name] = value.trim();
+    }
+  }
+}
+
 // ─── Service ────────────────────────────────────────────────────────────────
 
 export class InAppLoginService extends EventEmitter {
@@ -123,6 +137,19 @@ export class InAppLoginService extends EventEmitter {
         locale: "en-US",
       });
       const page = await context.newPage();
+      const credentials: Record<string, string> = {};
+
+      // Playwright normalizes request header names to lowercase. Capture only
+      // explicitly configured credentials and never replace the first token
+      // observed after login.
+      page.on("request", (request: { allHeaders(): Promise<Record<string, string>> }) => {
+        void request
+          .allHeaders()
+          .then((headers) => captureConfiguredHeaders(config.tokenSources, headers, credentials))
+          .catch(() => {
+            // Some browser-internal requests do not expose their full headers.
+          });
+      });
 
       // Navigate to login URL
       this.emit("status", {
@@ -134,7 +161,6 @@ export class InAppLoginService extends EventEmitter {
 
       // Poll for success URL + token extraction
       const maxPolls = Math.floor(maxTimeout / pollInterval);
-      const credentials: Record<string, string> = {};
       const startTime = Date.now();
 
       for (let i = 0; i < maxPolls; i++) {

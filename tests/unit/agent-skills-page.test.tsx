@@ -8,7 +8,12 @@ import type { AgentSkill, SkillCoverage } from "../../src/lib/agentSkills/types"
 
 // ── i18n stub ────────────────────────────────────────────────────────────────
 vi.mock("next-intl", () => ({
-  useTranslations: () => (key: string) => key,
+  useLocale: () => "en",
+  useTranslations: () => {
+    const t = (key: string) => key;
+    t.has = () => false;
+    return t;
+  },
 }));
 
 // ── next/link stub ───────────────────────────────────────────────────────────

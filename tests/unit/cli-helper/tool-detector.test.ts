@@ -2,6 +2,14 @@ import { describe, it, before } from "node:test";
 import assert from "node:assert";
 import * as toolDetector from "../../../src/lib/cli-helper/tool-detector.ts";
 
+// The Hermes tool detector honors a HERMES_HOME env var (#3628) and only falls
+// back to the default ~/.hermes/config.yaml path when it is unset. CI runs with
+// HERMES_HOME unset, but this suite can also run inside a Hermes Agent session
+// that exports HERMES_HOME, which redirects the detected config path and breaks
+// the ".hermes/config.yaml" assertion below. Unset it so the test is hermetic
+// and matches CI regardless of the ambient runtime.
+delete process.env.HERMES_HOME;
+
 describe("tool-detector", () => {
   before(() => {
     // Install mock exec implementation for deterministic testing
@@ -64,6 +72,14 @@ describe("tool-detector", () => {
         `expected configPath to include '.openclaw/openclaw.json', got: ${result!.configPath}`
       );
       assert.strictEqual(typeof result!.configured, "boolean");
+    });
+
+    it("normalizes the legacy kilocode id to the canonical kilo target", async () => {
+      const result = await toolDetector.detectTool("kilocode");
+      assert.ok(result !== null);
+      assert.strictEqual(result!.id, "kilo");
+      assert.strictEqual(result!.name, "Kilo Code");
+      assert.ok(result!.configPath.includes(".local/share/kilo/auth.json"));
     });
   });
 
