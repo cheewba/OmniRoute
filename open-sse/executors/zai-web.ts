@@ -92,11 +92,14 @@ async function resolveZaiBrowserAttachments(
     // Browser-page upload: keep the original bytes/mimeType (no Cursor wire prep).
     const images = await resolveCursorImages(imageUrls, { prepareForWire: false });
     return {
-      attachments: images.map((image, index) => ({
-        name: zaiImageFileName(image.mimeType, index),
-        mimeType: image.mimeType,
-        buffer: image.data,
-      })),
+      attachments: images.map((image, index) => {
+        const mimeType = image.mimeType || "image/png";
+        return {
+          name: zaiImageFileName(mimeType, index),
+          mimeType,
+          buffer: image.data,
+        };
+      }),
     };
   } catch (error) {
     const message =
